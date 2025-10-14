@@ -1,2 +1,259 @@
 #!/usr/bin/env bash
-# (paste your final emerge-progress script here)
+set -euo pipefail
+
+COLOR_MODE=auto   # auto|always|never
+QUIET=0           # 1 = progress-only
+UNTIL_PROGRESS=0  # 1 = print until first marker, then progress-only
+IDLE=0            # 1 = show idle spinner
+IDLE_THRESHOLD=1  # seconds since last marker before showing spinner
+IDLE_INTERVAL=200 # spinner frame ms
+CMD=()
+
+usage() {
+  cat <<USAGE
+emerge-progress [--color=auto|always|never] [-p|--progress-only] [-U|--until-progress]
+            [--idle[=ms]] [--idle-threshold=seconds] [--] [command ...]
+USAGE
+}
+
+# --- Parse flags
+while (( $# )); do
+  case "$1" in
+    --color=*) COLOR_MODE="${1#*=}"; shift;;
+    --color)   echo "Use --color=auto|always|never" >&2; exit 2;;
+    -p|--progress-only) QUIET=1; shift;;
+    -U|--until-progress) UNTIL_PROGRESS=1; shift;;
+    -I|--idle) IDLE=1; shift;;
+    --idle=*)  IDLE=1; IDLE_INTERVAL="${1#*=}"; shift;;
+    --idle-threshold=*) IDLE=1; IDLE_THRESHOLD="${1#*=}"; shift;;
+    -h|--help) usage; exit 0;;
+    --) shift; CMD=("$@"); break;;
+    -*) echo "Unknown option: $1" >&2; usage; exit 2;;
+    *)  CMD=("$@"); break;;
+  esac
+done
+
+# --- Decide color on stderr + whether we can set terminal title
+stderr_is_tty=0; [ -t 2 ] && stderr_is_tty=1
+enable_color=0
+case "$COLOR_MODE" in
+  always) enable_color=1;;
+  never)  enable_color=0;;
+  auto)   enable_color=$stderr_is_tty;;
+  *) echo "Invalid --color value: $COLOR_MODE" >&2; exit 2;;
+esac
+
+# ANSI colors (bright magenta for >>> lines)
+if (( enable_color )); then
+  if command -v tput >/dev/null 2>&1; then
+    RED="$(tput setaf 1)"; YEL="$(tput setaf 3)"; GRN="$(tput setaf 2)"
+    MAG="$(tput setaf 5)"; BLD="$(tput bold)"; RST="$(tput sgr0)"
+  else
+    RED=$'\033[31m'; YEL=$'\033[33m'; GRN=$'\033[32m'
+    MAG=$'\033[35m'; BLD=$'\033[1m';  RST=$'\033[0m'
+  fi
+else
+  RED=""; YEL=""; GRN=""; MAG=""; BLD=""; RST=""
+fi
+
+# --- Idle spinner (background). Exits when stopfile appears.
+spinner() {
+  local timefile="$1" stopfile="$2" interval_ms="$3" thresh_s="$4"
+  local frames='|/-\' i=0 last=0 now=0
+  printf '%(%s)T\n' -1 > "$timefile" 2>/dev/null || date +%s > "$timefile"
+  while :; do
+    [[ -f "$stopfile" ]] && break
+    awk -v ms="$interval_ms" 'BEGIN{system("sleep " ms/1000)}' >/dev/null 2>&1
+    [[ -f "$stopfile" ]] && break
+    now=$(date +%s)
+    if [[ -r "$timefile" ]]; then
+      last=$(cat "$timefile" 2>/dev/null || echo 0)
+    else
+      last=0
+    fi
+    if (( now - last >= thresh_s )); then
+      printf "\r(idle %s) " "${frames:i%${#frames}:1}" >&2
+      ((i++))
+    fi
+  done
+}
+
+run_filter() {
+  local cols="${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}"
+  local quiet="$1" until="$2" timefile="$3" stopfile="$4" tty="$5"
+  local red="$6" yel="$7" grn="$8" mag="$9" bld="${10}" rst="${11}"
+
+  awk -v cols="$cols" -v quiet="$quiet" -v until="$until" \
+      -v timefile="$timefile" -v stopfile="$stopfile" -v TTY="$tty" \
+      -v RED="$red" -v YEL="$yel" -v GRN="$grn" -v MAG="$mag" -v BLD="$bld" -v RST="$rst" '
+  BEGIN {
+    IGNORECASE = 1
+    start_time = 0; last_time = 0; last_cur = 0; ema_rate = 0
+    saw_progress = 0
+    pkg = ""; count_text = ""; phase = ""
+  }
+
+  # --- helpers ---
+  function color_for(pct) {
+    if (RED == "" && YEL == "" && GRN == "") return ""
+    if (pct < 20)  return RED BLD
+    if (pct < 50)  return YEL BLD
+    return GRN BLD
+  }
+  function fmt_time(sec,    s,h,m) {
+    if (sec < 0) sec = 0
+    h = int(sec/3600); m = int((sec%3600)/60); s = int(sec%60)
+    if (h > 0) return sprintf("%d:%02d:%02d", h, m, s)
+    return sprintf("%02d:%02d", m, s)
+  }
+  function map_phase(s,    out) {
+    if (s ~ /Compil(ing|ed)/)        return "Compile"
+    if (s ~ /Configur(ing|ed)/)      return "Configure"
+    if (s ~ /Prepar(ing|ed)/)        return "Prepare"
+    if (s ~ /(Fetch|Download)(ing|ed)/) return "Download"
+    if (s ~ /Unpack(ing|ed)/)        return "Unpack"
+    if (s ~ /Install(ing|ed)/)       return "Install"
+    if (s ~ /Test(ing|ed)/)          return "Test"
+    if (s ~ /Merge(ing|d)|Completed installing/) return "Merge"
+    return s
+  }
+  function set_title_from_state(    title) {
+    if (!TTY) return
+    if (pkg != "" && count_text != "" && phase != "") {
+      title = sprintf("emerge: (%s) %s %s", count_text, pkg, phase)
+    } else if (pkg != "" && count_text != "") {
+      title = sprintf("emerge: (%s) %s", count_text, pkg)
+    } else {
+      return
+    }
+    # OSC title
+    printf "\033]0;%s\007", title > "/dev/stderr"
+    fflush("/dev/stderr")
+  }
+  function set_title_from_line(line,    m1,m2) {
+    # Try specific patterns to capture pkg and counts
+    if (match(line, /^>>> +Emerging +\(([^)]+)\) +([A-Za-z0-9+_.@-]+\/[^ ]+)/, m1)) {
+      count_text = m1[1]; pkg = m1[2]; phase = "Emerging"
+      set_title_from_state(); return 1
+    }
+    if (match(line, /^>>> +Installing +\(([^)]+)\) +([A-Za-z0-9+_.@-]+\/[^ ]+)/, m1)) {
+      count_text = m1[1]; pkg = m1[2]; phase = "Install"
+      set_title_from_state(); return 1
+    }
+    # Generic >>> line: infer phase word and reuse last pkg/count if we have them
+    if (match(line, /^>>> +(.*)$/, m2)) {
+      phase = map_phase(m2[1])
+      set_title_from_state(); return 1
+    }
+    return 0
+  }
+  function important_line(s) {
+    # Always surface important stuff even when quiet:
+    if (s ~ /^(\s*\*\s+)?QA( Notice|:)/) return 1
+    if (s ~ /^!!!/) return 1
+    if (s ~ /(^|[^A-Za-z])(warning|error):/) return 1
+    return 0
+  }
+  function draw(pct, cur, total, now,    barw, fill, bar, space, col, elapsed, eta_s, eta_txt) {
+    if (total <= 0) return
+    barw = cols - 24; if (barw < 10) barw = 10
+    fill = int(barw * pct / 100)
+    bar  = sprintf("%" fill "s",""); gsub(/ /,"#",bar)
+    space= sprintf("%" (barw - fill) "s","")
+    col  = color_for(pct)
+
+    if (start_time == 0) start_time = now
+    elapsed = now - start_time
+
+    # EMA for smoother ETA
+    if (last_time > 0 && now > last_time && cur > last_cur) {
+      inst_rate = (cur - last_cur) / (now - last_time)
+      if (ema_rate == 0) ema_rate = inst_rate
+      else               ema_rate = 0.3*inst_rate + 0.7*ema_rate
+    } else if (ema_rate == 0 && elapsed > 0) {
+      ema_rate = cur / elapsed
+    }
+
+    if (ema_rate > 0) eta_s = (total - cur) / ema_rate
+    else              eta_s = -1
+    eta_txt = (eta_s >= 0 ? fmt_time(eta_s) : "--:--")
+
+    printf "\r%s[%s%s]%s %3d%% (%d/%d)  %s elapsed, ETA %s",
+           col, bar, space, RST, pct, cur, total, fmt_time(elapsed), eta_txt > "/dev/stderr"
+    fflush("/dev/stderr")
+
+    # Update spinner timefile
+    now = systime()
+    print now > timefile
+    close(timefile)
+
+    last_time = now
+    last_cur  = cur
+  }
+
+  {
+    line = $0
+
+    # Always show phase lines (>>> ...) in magenta, and set title
+    if (line ~ /^>>>/) {
+      printf "%s%s%s\n", MAG BLD, line, RST
+      set_title_from_line(line)
+      next
+    }
+
+    # Printing rules:
+    if (!quiet) {
+      if (until) {
+        if (!saw_progress) print line
+      } else {
+        print line
+      }
+    } else {
+      if (important_line(line)) print line
+    }
+
+    # Try to update title opportunistically (e.g., if a later >>> refined state)
+    # (No-op here unless we add more patterns.)
+
+    # Progress detection
+    rest = line
+    while (match(rest, /\[([0-9]+)\/([0-9]+)\]/, m)) {
+      cur   = m[1] + 0
+      total = m[2] + 0
+      pct   = (total > 0) ? int(cur * 100 / total) : 0
+      draw(pct, cur, total, systime())
+      saw_progress = 1
+      rest = substr(rest, RSTART + RLENGTH)
+    }
+  }
+  END {
+    if (saw_progress) printf "\n" > "/dev/stderr"
+    # stop spinner
+    print "1" > stopfile
+    close(stopfile)
+  }'
+}
+
+main() {
+  # temp files for spinner coordination
+  local timefile stopfile SPINNER_PID
+  timefile="$(mktemp -t ebprog.time.XXXXXX)"
+  stopfile="$(mktemp -t ebprog.stop.XXXXXX)"
+
+  cleanup() {
+    if [[ -n "${SPINNER_PID:-}" ]]; then kill "$SPINNER_PID" 2>/dev/null || true; fi
+    rm -f "$timefile" "$stopfile"
+  }
+  trap cleanup EXIT INT TERM
+
+  if (( ${#CMD[@]} )); then
+    if (( IDLE )); then spinner "$timefile" "$stopfile" "$IDLE_INTERVAL" "$IDLE_THRESHOLD" & SPINNER_PID=$!; fi
+    stdbuf -oL -eL "${CMD[@]}" 2>&1 | run_filter "$QUIET" "$UNTIL_PROGRESS" "$timefile" "$stopfile" "$stderr_is_tty" "$RED" "$YEL" "$GRN" "$MAG" "$BLD" "$RST"
+    exit ${PIPESTATUS[0]}
+  else
+    if (( IDLE )); then spinner "$timefile" "$stopfile" "$IDLE_INTERVAL" "$IDLE_THRESHOLD" & SPINNER_PID=$!; fi
+    run_filter "$QUIET" "$UNTIL_PROGRESS" "$timefile" "$stopfile" "$stderr_is_tty" "$RED" "$YEL" "$GRN" "$MAG" "$BLD" "$RST"
+  fi
+}
+
+main "$@"
