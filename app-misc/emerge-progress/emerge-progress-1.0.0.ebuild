@@ -3,7 +3,7 @@ DESCRIPTION="Emerge progress viewer with ETA, idle spinner, phase highlighting, 
 HOMEPAGE="https://github.com/REPLACE_ME/gentoo-overlay"
 LICENSE="MIT"
 SLOT="0"
-KEYWORDS="~amd64"
+KEYWORDS=""
 
 # We ship the script directly from FILESDIR (no external distfiles)
 SRC_URI=""
