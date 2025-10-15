@@ -39,6 +39,8 @@ while (( $# )); do
   esac
 done
 
+# Force emerge color only when our stderr is a real TTY
+
 # --- Decide color on stderr + TTY for title updates ---
 stderr_is_tty=0; [ -t 2 ] && stderr_is_tty=1
 enable_color=0
@@ -48,6 +50,11 @@ case "$COLOR_MODE" in
   auto)   enable_color=$stderr_is_tty;;
   *) echo "Invalid --color value: $COLOR_MODE" >&2; exit 2;;
 esac
+
+EMERGE_COLOR_OPTS=()
+if (( stderr_is_tty )); then
+  EMERGE_COLOR_OPTS=(--color y)
+fi
 
 # ANSI colors (bright magenta for >>> lines)
 if (( enable_color )); then
@@ -95,7 +102,7 @@ run_filter() {
     pkg = ""; count_text = ""; phase = ""
   }
 
-  function color_for(pct){ if(RED==""&&YEL==""&&GRN=="")return ""; if(pct<20)return RED BLD; if(pct<50)return YEL BLD; return GRN BLD }
+  function color_for(pct){ if(RED==""&&YEL==""&&GRN=="")return ""; return GRN BLD }
   function fmt_time(sec, s,h,m){ if(sec<0)sec=0; h=int(sec/3600); m=int((sec%3600)/60); s=int(sec%60); return (h>0)?sprintf("%d:%02d:%02d",h,m,s):sprintf("%02d:%02d",m,s) }
   function map_phase(s){ if(s~/Compil(ing|ed)/)return "Compile"; if(s~/Configur(ing|ed)/)return "Configure"; if(s~/Prepar(ing|ed)/)return "Prepare";
                          if(s~/(Fetch|Download)(ing|ed)/)return "Download"; if(s~/Unpack(ing|ed)/)return "Unpack"; if(s~/Install(ing|ed)/)return "Install";
@@ -135,9 +142,9 @@ run_filter() {
   {
     line=$0
 
-    # Always show Portage phase lines (>>> ...) in magenta and update title
+    # Always show Portage phase lines (>>> ...) in yellow and update title
     if(line ~ /^>>>/){
-      printf "%s%s%s\n", MAG BLD, line, RST
+      printf "%s%s%s\n", YEL BLD, line, RST
       set_title_from_line(line)
       next
     }
@@ -181,7 +188,7 @@ main() {
   (( IDLE )) && spinner "$timefile" "$stopfile" "$IDLE_INTERVAL" "$IDLE_THRESHOLD" & SPINNER_PID=$!
 
   # Always run emerge with the args we captured; make stdout/stderr line-buffered
-  stdbuf -oL -eL emerge "${EMERGE_ARGS[@]}" 2>&1 | run_filter "$QUIET" "$UNTIL_PROGRESS" "$timefile" "$stopfile" "$stderr_is_tty" "$RED" "$YEL" "$GRN" "$MAG" "$BLD" "$RST"
+  stdbuf -oL -eL emerge "${EMERGE_COLOR_OPTS[@]}" "${EMERGE_ARGS[@]}" 2>&1| run_filter "$QUIET" "$UNTIL_PROGRESS" "$timefile" "$stopfile" "$stderr_is_tty" "$RED" "$YEL" "$GRN" "$MAG" "$BLD" "$RST"
   exit ${PIPESTATUS[0]}
 }
 
