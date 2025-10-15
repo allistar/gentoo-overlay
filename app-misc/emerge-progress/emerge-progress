@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# --- Script options (do not collide with emerge flags) ---
+COLOR_MODE=auto   # auto|always|never
+QUIET=1           # 1 = hide normal lines AFTER first [N/M]
+UNTIL_PROGRESS=1  # 1 = same as QUIET trigger behavior
+IDLE=0            # 1 = idle spinner
+IDLE_THRESHOLD=1  # seconds idle before spinner shows
+IDLE_INTERVAL=200 # spinner frame ms
+
+EMERGE_ARGS=()    # everything not recognized as script flags goes here
+
+usage() {
+  cat <<USAGE
+emerge-progress [--color=auto|always|never] [-p|--progress-only] [-U|--until-progress]
+                [--idle[=ms]] [--idle-threshold=seconds] [--] [emerge-args...]
+Examples:
+  emerge-progress -1 qtbase
+  emerge-progress @world -uDNav
+  emerge-progress --sync
+  emerge-progress -U -I -- @world -uDN --with-bdeps=y
+USAGE
+}
+
+# --- Parse script flags; first unknown token => treat rest as EMERGE_ARGS ---
+while (( $# )); do
+  case "$1" in
+    --color=*) COLOR_MODE="${1#*=}"; shift;;
+    --color)   echo "Use --color=auto|always|never" >&2; exit 2;;
+    -p|--progress-only) QUIET=1; shift;;
+    -U|--until-progress) UNTIL_PROGRESS=1; shift;;
+    -I|--idle) IDLE=1; shift;;
+    --idle=*)  IDLE=1; IDLE_INTERVAL="${1#*=}"; shift;;
+    --idle-threshold=*) IDLE=1; IDLE_THRESHOLD="${1#*=}"; shift;;
+    -h|--help) usage; exit 0;;
+    --) shift; EMERGE_ARGS=("$@"); break;;
+    *) EMERGE_ARGS=("$@"); break;;   # pass all remaining as emerge args
+  esac
+done
+
+# Force emerge color only when our stderr is a real TTY
+
+# --- Decide color on stderr + TTY for title updates ---
+stderr_is_tty=0; [ -t 2 ] && stderr_is_tty=1
+enable_color=0
+case "$COLOR_MODE" in
+  always) enable_color=1;;
+  never)  enable_color=0;;
+  auto)   enable_color=$stderr_is_tty;;
+  *) echo "Invalid --color value: $COLOR_MODE" >&2; exit 2;;
+esac
+
+EMERGE_COLOR_OPTS=()
+if (( stderr_is_tty )); then
+  EMERGE_COLOR_OPTS=(--color y)
+fi
+
+# ANSI colors (bright magenta for >>> lines)
+if (( enable_color )); then
+  if command -v tput >/dev/null 2>&1; then
+    RED="$(tput setaf 1)"; YEL="$(tput setaf 3)"; GRN="$(tput setaf 2)"
+    MAG="$(tput setaf 5)"; BLD="$(tput bold)"; RST="$(tput sgr0)"
+  else
+    RED=$'\033[31m'; YEL=$'\033[33m'; GRN=$'\033[32m'
+    MAG=$'\033[35m'; BLD=$'\033[1m';  RST=$'\033[0m'
+  fi
+else
+  RED=""; YEL=""; GRN=""; MAG=""; BLD=""; RST=""
+fi
+
+# --- Idle spinner (background) ---
+spinner() {
+  local timefile="$1" stopfile="$2" interval_ms="$3" thresh_s="$4"
+  local frames='|/-\' i=0 last=0 now=0
+  printf '%(%s)T\n' -1 > "$timefile" 2>/dev/null || date +%s > "$timefile"
+  while :; do
+    [[ -f "$stopfile" ]] && break
+    awk -v ms="$interval_ms" 'BEGIN{system("sleep " ms/1000)}' >/dev/null 2>&1
+    [[ -f "$stopfile" ]] && break
+    now=$(date +%s)
+    if [[ -r "$timefile" ]]; then last=$(cat "$timefile" 2>/dev/null || echo 0); else last=0; fi
+    if (( now - last >= thresh_s )); then
+      printf "\r(idle %s) " "${frames:i%${#frames}:1}" >&2
+      ((i++))
+    fi
+  done
+}
+
+run_filter() {
+  local cols="${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}"
+  local quiet="$1" until="$2" timefile="$3" stopfile="$4" tty="$5"
+  local red="$6" yel="$7" grn="$8" mag="$9" bld="${10}" rst="${11}"
+
+  awk -v cols="$cols" -v quiet="$quiet" -v until="$until" \
+      -v timefile="$timefile" -v stopfile="$stopfile" -v TTY="$tty" \
+      -v RED="$red" -v YEL="$yel" -v GRN="$grn" -v MAG="$mag" -v BLD="$bld" -v RST="$rst" '
+  BEGIN {
+    IGNORECASE = 1
+    start_time = last_time = last_cur = ema_rate = 0
+    saw_progress = 0
+    pkg = ""; count_text = ""; phase = ""
+  }
+
+  function color_for(pct){ if(RED==""&&YEL==""&&GRN=="")return ""; return GRN BLD }
+  function fmt_time(sec, s,h,m){ if(sec<0)sec=0; h=int(sec/3600); m=int((sec%3600)/60); s=int(sec%60); return (h>0)?sprintf("%d:%02d:%02d",h,m,s):sprintf("%02d:%02d",m,s) }
+  function map_phase(s){ if(s~/Compil(ing|ed)/)return "Compile"; if(s~/Configur(ing|ed)/)return "Configure"; if(s~/Prepar(ing|ed)/)return "Prepare";
+                         if(s~/(Fetch|Download)(ing|ed)/)return "Download"; if(s~/Unpack(ing|ed)/)return "Unpack"; if(s~/Install(ing|ed)/)return "Install";
+                         if(s~/Test(ing|ed)/)return "Test"; if(s~/Merge(ing|d)|Completed installing/)return "Merge"; return s }
+  function set_title(){ if(!TTY)return; if(pkg!=""&&count_text!=""&&phase!=""){ printf "\033]0;emerge: (%s) %s %s\007", count_text, pkg, phase > "/dev/stderr"; fflush("/dev/stderr") } }
+  function set_title_from_line(line, m1,m2){
+    if(match(line, /^>>> +Emerging +\(([^)]+)\) +([A-Za-z0-9+_.@-]+\/[^ ]+)/, m1)){
+      count_text=m1[1];
+      pkg=m1[2];
+      phase="Emerging";
+      set_title();
+      # --- RESET per-package timing & progress state ---
+      start_time = systime();
+      last_time  = 0;
+      last_cur   = 0;
+      ema_rate   = 0;
+      last_pct   = 0;
+      last_total = 0;
+      saw_progress = 0;
+      return 1;
+    }
+    if(match(line, /^>>> +Installing +\(([^)]+)\) +([A-Za-z0-9+_.@-]+\/[^ ]+)/, m1)){ count_text=m1[1]; pkg=m1[2]; phase="Install";  set_title(); return 1 }
+    if(match(line, /^>>> +(.*)$/, m2)){ phase=map_phase(m2[1]); set_title(); return 1 }
+    return 0
+  }
+  function important_line(s){ if(s~/^(\s*\*\s+)?QA( Notice|:)/)return 1; if(s~/^!!!/)return 1; if(s~/([^A-Za-z]|^)(warning|error):/)return 1; return 0 }
+
+  function draw(pct,cur,total,now, barw,fill,bar,space,col,elapsed,eta_s,eta_txt){
+    if(total<=0)return
+    barw=cols-24; if(barw<10)barw=10
+    fill=int(barw*pct/100)
+    bar=sprintf("%" fill "s",""); gsub(/ /,"#",bar)
+    space=sprintf("%" (barw-fill) "s","")
+    col=color_for(pct)
+
+    if(start_time==0)start_time=now
+    elapsed=now-start_time
+    if(last_time>0 && now>last_time && cur>last_cur){
+      inst_rate=(cur-last_cur)/(now-last_time)
+      if(ema_rate==0)ema_rate=inst_rate; else ema_rate=0.3*inst_rate+0.7*ema_rate
+    } else if(ema_rate==0 && elapsed>0){ ema_rate=cur/elapsed }
+    eta_s=(ema_rate>0)?(total-cur)/ema_rate:-1; eta_txt=(eta_s>=0?fmt_time(eta_s):"--:--")
+
+    printf "\r%s[%s%s]%s %3d%% (%d/%d)  %s elapsed, ETA %s", col, bar, space, RST, pct, cur, total, fmt_time(elapsed), eta_txt > "/dev/stderr"
+    fflush("/dev/stderr")
+
+    now=systime(); print now > timefile; close(timefile)
+    last_time=now; last_cur=cur
+  }
+
+  {
+    line=$0
+
+    # Always show Portage phase lines (>>> ...) in yellow and update title
+    if(line ~ /^>>>/){
+      printf "%s%s%s\n", YEL BLD, line, RST
+      set_title_from_line(line)
+      next
+    }
+
+    # --- Hiding policy: only after first [N/M] marker ---
+    eff_quiet = (quiet || until) ? 1 : 0
+    if(eff_quiet && !saw_progress){
+      print line                               # before first marker: show everything
+    } else if(eff_quiet && saw_progress){
+      if(important_line(line)) print line       # after first marker: surface important lines
+    } else {
+      print line                                # not in quiet: print all
+    }
+
+    # Progress detection
+    rest=line
+    while(match(rest, /\[([0-9]+)\/([0-9]+)\]/, m)){
+      cur=m[1]+0; total=m[2]+0; pct=(total>0)?int(cur*100/total):0
+      draw(pct,cur,total,systime())
+      saw_progress=1
+      rest=substr(rest, RSTART+RLENGTH)
+    }
+  }
+  END{
+    if(saw_progress) printf "\n" > "/dev/stderr"
+    print "1" > stopfile; close(stopfile)
+  }'
+}
+
+main() {
+  local timefile stopfile SPINNER_PID
+  timefile="$(mktemp -t ebprog.time.XXXXXX)"
+  stopfile="$(mktemp -t ebprog.stop.XXXXXX)"
+
+  cleanup() {
+    if [[ -n "${SPINNER_PID:-}" ]]; then kill "$SPINNER_PID" 2>/dev/null || true; fi
+    rm -f "$timefile" "$stopfile"
+  }
+  trap cleanup EXIT INT TERM
+
+  (( IDLE )) && spinner "$timefile" "$stopfile" "$IDLE_INTERVAL" "$IDLE_THRESHOLD" & SPINNER_PID=$!
+
+  # Always run emerge with the args we captured; make stdout/stderr line-buffered
+  stdbuf -oL -eL emerge "${EMERGE_COLOR_OPTS[@]}" "${EMERGE_ARGS[@]}" 2>&1| run_filter "$QUIET" "$UNTIL_PROGRESS" "$timefile" "$stopfile" "$stderr_is_tty" "$RED" "$YEL" "$GRN" "$MAG" "$BLD" "$RST"
+  exit ${PIPESTATUS[0]}
+}
+
+main "$@"
