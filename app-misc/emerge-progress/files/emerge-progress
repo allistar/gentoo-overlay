@@ -59,14 +59,16 @@ fi
 # ANSI colors (bright magenta for >>> lines)
 if (( enable_color )); then
   if command -v tput >/dev/null 2>&1; then
-    RED="$(tput setaf 1)"; YEL="$(tput setaf 3)"; GRN="$(tput setaf 2)"
-    MAG="$(tput setaf 5)"; BLD="$(tput bold)"; RST="$(tput sgr0)"
+    RED="$(tput setaf 1)"; YEL="$(tput setaf 3)"; GRN="$(tput setaf 40)";
+    MAG="$(tput setaf 5)"; BLD="$(tput bold)"; RST="$(tput sgr0)";
+    PRP="$(tput setaf 21)";
   else
-    RED=$'\033[31m'; YEL=$'\033[33m'; GRN=$'\033[32m'
-    MAG=$'\033[35m'; BLD=$'\033[1m';  RST=$'\033[0m'
+    RED=$'\033[31m'; YEL=$'\033[33m'; GRN=$'\033[32m';
+    MAG=$'\033[35m'; BLD=$'\033[1m';  RST=$'\033[0m';
+    PRP=$'\033[94m';
   fi
 else
-  RED=""; YEL=""; GRN=""; MAG=""; BLD=""; RST=""
+  RED=""; YEL=""; GRN=""; MAG=""; BLD=""; RST=""; PRP=""
 fi
 
 # --- Idle spinner (background) ---
@@ -90,11 +92,11 @@ spinner() {
 run_filter() {
   local cols="${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}"
   local quiet="$1" until="$2" timefile="$3" stopfile="$4" tty="$5"
-  local red="$6" yel="$7" grn="$8" mag="$9" bld="${10}" rst="${11}"
+  local red="$6" yel="$7" grn="$8" mag="$9" prp="${10}" bld="${11}" rst="${12}"
 
   awk -v cols="$cols" -v quiet="$quiet" -v until="$until" \
       -v timefile="$timefile" -v stopfile="$stopfile" -v TTY="$tty" \
-      -v RED="$red" -v YEL="$yel" -v GRN="$grn" -v MAG="$mag" -v BLD="$bld" -v RST="$rst" '
+      -v RED="$red" -v YEL="$yel" -v GRN="$grn" -v MAG="$mag" -v BLD="$bld" -v RST="$rst" -v PRP="$prp" '
   BEGIN {
     IGNORECASE = 1
     start_time = last_time = last_cur = ema_rate = 0
@@ -136,7 +138,7 @@ run_filter() {
     if(total<=0)return
     barw=cols-24; if(barw<10)barw=10
     fill=int(barw*pct/100)
-    bar=sprintf("%" fill "s",""); gsub(/ /,"#",bar)
+    bar=sprintf("%" fill "s",""); gsub(/ /,"\u2593",bar)
     space=sprintf("%" (barw-fill) "s","")
     col=color_for(pct)
 
@@ -204,7 +206,7 @@ main() {
   (( IDLE )) && spinner "$timefile" "$stopfile" "$IDLE_INTERVAL" "$IDLE_THRESHOLD" & SPINNER_PID=$!
 
   # Always run emerge with the args we captured; make stdout/stderr line-buffered
-  stdbuf -oL -eL emerge "${EMERGE_COLOR_OPTS[@]}" "${EMERGE_ARGS[@]}" 2>&1| run_filter "$QUIET" "$UNTIL_PROGRESS" "$timefile" "$stopfile" "$stderr_is_tty" "$RED" "$YEL" "$GRN" "$MAG" "$BLD" "$RST"
+  stdbuf -oL -eL emerge "${EMERGE_COLOR_OPTS[@]}" "${EMERGE_ARGS[@]}" 2>&1| run_filter "$QUIET" "$UNTIL_PROGRESS" "$timefile" "$stopfile" "$stderr_is_tty" "$RED" "$YEL" "$GRN" "$MAG" "$PRP" "$BLD" "$RST"
   exit ${PIPESTATUS[0]}
 }
 
