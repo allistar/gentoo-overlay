@@ -71,6 +71,9 @@ else
   RED=""; YEL=""; GRN=""; MAG=""; BLD=""; RST=""; PRP=""
 fi
 
+# When exiting, reset the title
+trap 'printf "\033]0;${USER}@${HOSTNAME%%.*}:${PWD/$HOME/~}\007"' EXIT
+
 # --- Idle spinner (background) ---
 spinner() {
   local timefile="$1" stopfile="$2" interval_ms="$3" thresh_s="$4"
