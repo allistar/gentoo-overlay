@@ -71,18 +71,22 @@ else
   RED=""; YEL=""; GRN=""; MAG=""; BLD=""; RST=""; PRP=""
 fi
 
-# When exiting, reset the title
-trap 'printf "\033]0;${USER}@${HOSTNAME%%.*}:${PWD/$HOME/~}\007"' EXIT
+# Save the current terminal title on the xterm title stack
+(( stderr_is_tty )) && printf '\033[22;0t' >&2
 
 # --- Idle spinner (background) ---
 spinner() {
-  local timefile="$1" stopfile="$2" interval_ms="$3" thresh_s="$4"
+  local timefile="$1" stopfile="$2" interval_ms="$3" thresh_s="$4" togglefile="${5:-}"
   local frames='|/-\' i=0 last=0 now=0
   printf '%(%s)T\n' -1 > "$timefile" 2>/dev/null || date +%s > "$timefile"
   while :; do
-    [[ -f "$stopfile" ]] && break
+    [[ -s "$stopfile" ]] && break
     awk -v ms="$interval_ms" 'BEGIN{system("sleep " ms/1000)}' >/dev/null 2>&1
-    [[ -f "$stopfile" ]] && break
+    [[ -s "$stopfile" ]] && break
+    # Suppress spinner when in raw mode
+    if [[ -n "$togglefile" && -r "$togglefile" ]] && [[ "$(cat "$togglefile" 2>/dev/null)" == "1" ]]; then
+      continue
+    fi
     now=$(date +%s)
     if [[ -r "$timefile" ]]; then last=$(cat "$timefile" 2>/dev/null || echo 0); else last=0; fi
     if (( now - last >= thresh_s )); then
@@ -92,19 +96,59 @@ spinner() {
   done
 }
 
+# --- Key reader (background): toggle raw/progress mode on bare Esc ---
+# Uses stty + dd instead of read -rsn1 to avoid repeated tcsetattr calls
+# that race with awk's \r-based progress bar on the same terminal.
+key_reader() {
+  local togglefile="$1" stopfile="$2"
+  local raw_mode=0 char=""
+  local orig_stty
+  orig_stty=$(stty -g -F /dev/tty 2>/dev/null) || orig_stty=""
+  trap 'stty "${orig_stty:-sane}" -F /dev/tty 2>/dev/null; exec 3<&- 2>/dev/null' EXIT
+  stty -icanon -echo min 0 time 2 -F /dev/tty 2>/dev/null || true
+  exec 3</dev/tty
+
+  while :; do
+    [[ -s "$stopfile" ]] && break
+    char=$(dd bs=1 count=1 <&3 2>/dev/null) || true
+    [[ -s "$stopfile" ]] && break
+    if [[ "$char" == " " ]]; then
+      if (( raw_mode )); then
+        raw_mode=0
+        printf '%s\n' "0" > "$togglefile"
+        printf '\r\033[2K%s[progress bar resumed]%s\n' "$YEL" "$RST" >&2
+      else
+        raw_mode=1
+        printf '%s\n' "1" > "$togglefile"
+        printf '\r\033[2K%s[raw output mode — press Space to resume progress bar]%s\n' "$YEL" "$RST" >&2
+      fi
+    fi
+  done
+  exec 3<&-
+}
+
 run_filter() {
   local cols="${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}"
   local quiet="$1" until="$2" timefile="$3" stopfile="$4" tty="$5"
-  local red="$6" yel="$7" grn="$8" mag="$9" prp="${10}" bld="${11}" rst="${12}"
+  local red="$6" yel="$7" grn="$8" mag="$9" prp="${10}" bld="${11}" rst="${12}" togglefile="${13}"
 
   awk -v cols="$cols" -v quiet="$quiet" -v until="$until" \
       -v timefile="$timefile" -v stopfile="$stopfile" -v TTY="$tty" \
+      -v togglefile="$togglefile" \
       -v RED="$red" -v YEL="$yel" -v GRN="$grn" -v MAG="$mag" -v BLD="$bld" -v RST="$rst" -v PRP="$prp" '
   BEGIN {
     IGNORECASE = 1
     start_time = last_time = last_cur = ema_rate = 0
+    smooth_eta = -1
     saw_progress = 0
+    raw_mode = 0
     pkg = ""; count_text = ""; phase = ""
+  }
+
+  function check_toggle(    val) {
+    if (togglefile == "") return 0
+    if ((getline val < togglefile) > 0) { close(togglefile); return (val+0) }
+    close(togglefile); return 0
   }
 
   function color_for(pct){ if(RED==""&&YEL==""&&GRN=="")return ""; return GRN BLD }
@@ -128,6 +172,7 @@ run_filter() {
       ema_rate   = 0;
       last_pct   = 0;
       last_total = 0;
+      smooth_eta = -1;
       saw_progress = 0;
       return 1;
     }
@@ -137,7 +182,7 @@ run_filter() {
   }
   function important_line(s){ if(s~/^(\s*\*\s+)?QA( Notice|:)/)return 1; if(s~/^!!!/)return 1; if(s~/([^A-Za-z]|^)(warning|error):/)return 1; return 0 }
 
-  function draw(pct,cur,total,now, barw,fill,bar,space,col,elapsed,eta_s,eta_txt){
+  function draw(pct,cur,total,now, barw,fill,bar,space,col,elapsed,eta_s,eta_txt,overall_rate,blended_rate,weight,dt){
     if(total<=0)return
     barw=cols-24; if(barw<10)barw=10
     fill=int(barw*pct/100)
@@ -147,21 +192,53 @@ run_filter() {
 
     if(start_time==0)start_time=now
     elapsed=now-start_time
-    if(last_time>0 && now>last_time && cur>last_cur){
-      inst_rate=(cur-last_cur)/(now-last_time)
-      if(ema_rate==0)ema_rate=inst_rate; else ema_rate=0.3*inst_rate+0.7*ema_rate
-    } else if(ema_rate==0 && elapsed>0){ ema_rate=cur/elapsed }
-    eta_s=(ema_rate>0)?(total-cur)/ema_rate:-1; eta_txt=(eta_s>=0?fmt_time(eta_s):"--:--")
+
+    # Update rate: require >=1s gap and actual progress to avoid noise
+    dt=now-last_time
+    if(last_time>0 && dt>=1 && cur>last_cur){
+      inst_rate=(cur-last_cur)/dt
+      if(ema_rate==0) ema_rate=inst_rate
+      else ema_rate=0.1*inst_rate+0.9*ema_rate
+      last_time=now; last_cur=cur
+    } else if(last_time==0 && cur>0){
+      if(elapsed>0) ema_rate=cur/elapsed
+      last_time=now; last_cur=cur
+    }
+
+    # Blend EMA with overall average for stability;
+    # lean on overall average early, trust EMA more as progress advances
+    if(elapsed>0 && cur>0){
+      overall_rate=cur/elapsed
+      weight=0.2+0.5*(1-pct/100)
+      blended_rate=(ema_rate>0)?(1-weight)*ema_rate+weight*overall_rate:overall_rate
+    } else {
+      blended_rate=ema_rate
+    }
+
+    # Compute raw ETA, then smooth the displayed value to prevent jumps
+    if(blended_rate>0){
+      eta_s=(total-cur)/blended_rate
+      if(smooth_eta<0) smooth_eta=eta_s
+      else smooth_eta=0.2*eta_s+0.8*smooth_eta
+      eta_s=smooth_eta
+    } else {
+      eta_s=-1
+    }
+    eta_txt=(eta_s>=0?fmt_time(eta_s):"--:--")
 
     printf "\r%s[%s%s]%s %3d%% (%d/%d)  %s elapsed, ETA %s", col, bar, space, RST, pct, cur, total, fmt_time(elapsed), eta_txt > "/dev/stderr"
     fflush("/dev/stderr")
 
-    now=systime(); print now > timefile; close(timefile)
-    last_time=now; last_cur=cur
+    print systime() > timefile; close(timefile)
   }
 
   {
     line=$0
+    prev_raw = raw_mode
+    raw_mode = check_toggle()
+    if (raw_mode && !prev_raw) {
+      printf "\r\033[2K" > "/dev/stderr"; fflush("/dev/stderr")
+    }
 
     # Always show Portage phase lines (>>> ...) in yellow and update title
     if(line ~ /^>>>/){
@@ -172,7 +249,9 @@ run_filter() {
 
     # --- Hiding policy: only after first [N/M] marker ---
     eff_quiet = (quiet || until) ? 1 : 0
-    if(eff_quiet && !saw_progress){
+    if(raw_mode){
+      print line
+    } else if(eff_quiet && !saw_progress){
       print line                               # before first marker: show everything
     } else if(eff_quiet && saw_progress){
       if(important_line(line)) print line       # after first marker: surface important lines
@@ -184,7 +263,7 @@ run_filter() {
     rest=line
     while(match(rest, /\[([0-9]+)\/([0-9]+)\]/, m)){
       cur=m[1]+0; total=m[2]+0; pct=(total>0)?int(cur*100/total):0
-      draw(pct,cur,total,systime())
+      if (!raw_mode) draw(pct,cur,total,systime())
       saw_progress=1
       rest=substr(rest, RSTART+RLENGTH)
     }
@@ -196,20 +275,49 @@ run_filter() {
 }
 
 main() {
-  local timefile stopfile SPINNER_PID
+  local timefile stopfile togglefile SPINNER_PID KEY_READER_PID orig_stty
   timefile="$(mktemp -t ebprog.time.XXXXXX)"
   stopfile="$(mktemp -t ebprog.stop.XXXXXX)"
+  togglefile="$(mktemp -t ebprog.toggle.XXXXXX)"
+  printf '0\n' > "$togglefile"
+  KEY_READER_PID=""
+
+  # Save original stty as safety net for cleanup
+  if (( stderr_is_tty )); then
+    orig_stty=$(stty -g -F /dev/tty 2>/dev/null) || orig_stty=""
+  else
+    orig_stty=""
+  fi
 
   cleanup() {
+    if [[ -n "${KEY_READER_PID:-}" ]]; then kill "$KEY_READER_PID" 2>/dev/null || true; wait "$KEY_READER_PID" 2>/dev/null || true; fi
     if [[ -n "${SPINNER_PID:-}" ]]; then kill "$SPINNER_PID" 2>/dev/null || true; fi
-    rm -f "$timefile" "$stopfile"
+    rm -f "$timefile" "$stopfile" "$togglefile"
+    # Restore terminal settings as safety net
+    if [[ -n "${orig_stty:-}" ]]; then
+      stty "$orig_stty" -F /dev/tty 2>/dev/null || true
+    fi
+    # Restore the terminal title: set a sensible fallback first, then attempt
+    # the xterm title stack pop. Terminals that support the stack (xterm, foot,
+    # kitty, alacritty) will overwrite the fallback with the real original title.
+    # Terminals that don't (konsole) will keep the fallback.
+    if (( stderr_is_tty )); then
+      printf '\033]0;%s@%s:%s\007' "${USER}" "${HOSTNAME%%.*}" "${PWD/#$HOME/\~}" >&2
+      printf '\033[23;0t' >&2
+    fi
   }
   trap cleanup EXIT INT TERM
 
-  (( IDLE )) && spinner "$timefile" "$stopfile" "$IDLE_INTERVAL" "$IDLE_THRESHOLD" & SPINNER_PID=$!
+  # Start key reader for Esc toggle if stderr is a TTY
+  if (( stderr_is_tty )); then
+    key_reader "$togglefile" "$stopfile" &
+    KEY_READER_PID=$!
+  fi
+
+  (( IDLE )) && spinner "$timefile" "$stopfile" "$IDLE_INTERVAL" "$IDLE_THRESHOLD" "$togglefile" & SPINNER_PID=$!
 
   # Always run emerge with the args we captured; make stdout/stderr line-buffered
-  stdbuf -oL -eL emerge "${EMERGE_COLOR_OPTS[@]}" "${EMERGE_ARGS[@]}" 2>&1| run_filter "$QUIET" "$UNTIL_PROGRESS" "$timefile" "$stopfile" "$stderr_is_tty" "$RED" "$YEL" "$GRN" "$MAG" "$PRP" "$BLD" "$RST"
+  stdbuf -oL -eL emerge "${EMERGE_COLOR_OPTS[@]}" "${EMERGE_ARGS[@]}" 2>&1| run_filter "$QUIET" "$UNTIL_PROGRESS" "$timefile" "$stopfile" "$stderr_is_tty" "$RED" "$YEL" "$GRN" "$MAG" "$PRP" "$BLD" "$RST" "$togglefile"
   exit ${PIPESTATUS[0]}
 }
 
