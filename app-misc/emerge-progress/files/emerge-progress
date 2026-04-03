@@ -242,6 +242,7 @@ run_filter() {
 
     # Always show Portage phase lines (>>> ...) in yellow and update title
     if(line ~ /^>>>/){
+      if(saw_progress) { printf "\n" > "/dev/stderr"; fflush("/dev/stderr"); saw_progress=0 }
       printf "%s%s%s\n", YEL BLD, line, RST
       set_title_from_line(line)
       next
@@ -259,13 +260,20 @@ run_filter() {
       print line                                # not in quiet: print all
     }
 
-    # Progress detection
+    # Progress detection: [N/M] style
     rest=line
+    found_progress=0
     while(match(rest, /\[([0-9]+)\/([0-9]+)\]/, m)){
       cur=m[1]+0; total=m[2]+0; pct=(total>0)?int(cur*100/total):0
       if (!raw_mode) draw(pct,cur,total,systime())
-      saw_progress=1
+      saw_progress=1; found_progress=1
       rest=substr(rest, RSTART+RLENGTH)
+    }
+    # Progress detection: [ %NN ] percentage style
+    if(!found_progress && match(rest, /\[ *([0-9]+)% *\]/, m)){
+      pct=m[1]+0; if(pct>100)pct=100
+      if (!raw_mode) draw(pct,pct,100,systime())
+      saw_progress=1
     }
   }
   END{
@@ -290,12 +298,20 @@ main() {
   fi
 
   cleanup() {
+    # Guard against re-entrant cleanup (signal during cleanup)
+    [[ -n "${_cleanup_done:-}" ]] && return
+    _cleanup_done=1
+
     if [[ -n "${KEY_READER_PID:-}" ]]; then kill "$KEY_READER_PID" 2>/dev/null || true; wait "$KEY_READER_PID" 2>/dev/null || true; fi
-    if [[ -n "${SPINNER_PID:-}" ]]; then kill "$SPINNER_PID" 2>/dev/null || true; fi
-    rm -f "$timefile" "$stopfile" "$togglefile"
-    # Restore terminal settings as safety net
-    if [[ -n "${orig_stty:-}" ]]; then
-      stty "$orig_stty" -F /dev/tty 2>/dev/null || true
+    if [[ -n "${SPINNER_PID:-}" ]]; then kill "$SPINNER_PID" 2>/dev/null || true; wait "$SPINNER_PID" 2>/dev/null || true; fi
+    rm -f "${timefile:-}" "${stopfile:-}" "${togglefile:-}"
+    # Restore terminal settings: try saved settings first, then force sane defaults
+    if (( stderr_is_tty )); then
+      if [[ -n "${orig_stty:-}" ]]; then
+        stty "$orig_stty" -F /dev/tty 2>/dev/null || stty sane -F /dev/tty 2>/dev/null || true
+      else
+        stty sane -F /dev/tty 2>/dev/null || true
+      fi
     fi
     # Restore the terminal title: set a sensible fallback first, then attempt
     # the xterm title stack pop. Terminals that support the stack (xterm, foot,
@@ -306,7 +322,7 @@ main() {
       printf '\033[23;0t' >&2
     fi
   }
-  trap cleanup EXIT INT TERM
+  trap cleanup EXIT INT TERM HUP PIPE
 
   # Start key reader for Esc toggle if stderr is a TTY
   if (( stderr_is_tty )); then
@@ -314,7 +330,11 @@ main() {
     KEY_READER_PID=$!
   fi
 
-  (( IDLE )) && spinner "$timefile" "$stopfile" "$IDLE_INTERVAL" "$IDLE_THRESHOLD" "$togglefile" & SPINNER_PID=$!
+  SPINNER_PID=""
+  if (( IDLE )); then
+    spinner "$timefile" "$stopfile" "$IDLE_INTERVAL" "$IDLE_THRESHOLD" "$togglefile" &
+    SPINNER_PID=$!
+  fi
 
   # Always run emerge with the args we captured; make stdout/stderr line-buffered
   stdbuf -oL -eL emerge "${EMERGE_COLOR_OPTS[@]}" "${EMERGE_ARGS[@]}" 2>&1| run_filter "$QUIET" "$UNTIL_PROGRESS" "$timefile" "$stopfile" "$stderr_is_tty" "$RED" "$YEL" "$GRN" "$MAG" "$PRP" "$BLD" "$RST" "$togglefile"
