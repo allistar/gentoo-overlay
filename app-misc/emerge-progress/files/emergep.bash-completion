@@ -1,0 +1,9 @@
+# bash completion for emergep: reuse emerge's own completion. It is loaded on
+# first use, so sourcing this file only registers emergep.
+_emergep() {
+  _comp_load emerge 2>/dev/null || __load_completion emerge 2>/dev/null
+  declare -F _emerge >/dev/null || return
+  complete -o filenames -F _emerge emergep
+  _emerge "$@"
+}
+complete -o filenames -F _emergep emergep

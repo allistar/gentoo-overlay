@@ -1,0 +1,980 @@
+#!/usr/bin/env python3
+"""emergep: run emerge with a progress panel pinned to the bottom.
+
+emerge runs inside a pseudo-terminal. Until the first package starts building,
+its output is passed through untouched (so --ask prompts and the dependency
+spinner behave normally). From then on the build log scrolls in the top part
+of the screen and a status panel is drawn in the rows below it:
+
+  ────────────────────────────── 3 warnings · done ≈ 14:52 · space: full log ──
+   ⠼ (3/12) dev-qt/qtbase-6.8.1                                      Building
+     ██████████████▋              44%  1843/4120          12:04   ~15:10
+     █████▍                       27%  3/12 pkgs        1:02:11  ~1:48:20
+
+Per-package progress comes only from [N/M] (ninja) and [ NN%] (cmake's make
+generator) markers in the build output. Which packages will print them is
+known from their eclasses (cmake, meson, ninja-utils); other packages get a
+moving block with the elapsed and usual build time instead of a percentage.
+The overall ETA uses past build times from /var/log/emerge.log.
+"""
+
+import codecs
+import collections
+import fcntl
+import glob
+import os
+import queue
+import re
+import selectors
+import signal
+import statistics
+import struct
+import sys
+import termios
+import threading
+import time
+
+USAGE = """\
+usage: emergep [--ep-full] [--ep-warnings] [--ep-no-color] [--ep-help]
+               [--] [emerge-args...]
+
+Runs emerge with the build log scrolling above a progress panel pinned to the
+bottom of the terminal. Options for this script start with --ep- so they never
+collide with emerge's own options.
+
+Build output is filtered to Portage's messages (>>>, *, !!!, QA Notice) and
+errors. Compiler and configure warnings are counted in the panel but hidden;
+Portage itself reports the ones that matter as a QA Notice.
+
+  --ep-full       start by showing the full build output
+  --ep-warnings   also show compiler and configure warnings
+  --ep-no-color   no colour in the panel or in emerge's output
+  --ep-help       show this help
+
+Keys while building:
+  Space   toggle between filtered and full build output
+  Ctrl-C  interrupt emerge
+
+Examples:
+  emergep -1 qtbase
+  emergep -uDNav @world
+"""
+
+EMERGE_LOG = '/var/log/emerge.log'
+HISTORY_RUNS = 3      # average this many most recent builds of a package
+TICK = 0.1            # panel redraw interval, seconds
+MAX_SLOTS = 3         # most packages shown at once with --jobs
+MIN_STEPS = 10        # ignore [N/M] markers with fewer steps (e.g. "[0/1] Installing")
+RATE_WINDOW = 30      # seconds of [N/M] history used for the recent rate
+CONTEXT_LINES = 30    # recent build lines replayed when a package fails
+STATS_W = 39          # width of the numbers to the right of each bar
+DETAIL_W = 15         # width of the middle column of those numbers
+POLL_PHASE = 1.0      # seconds between checks of the build directory's phase markers
+SWEEP = 6             # width of the moving block on a bar with no progress info
+
+SPINNER = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+EIGHTHS = ' ▏▎▍▌▋▊▉'
+
+ANSI_RE = re.compile(r'\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[()][0-9A-Za-z]|[@-Z\\-_])')
+SGR_RE = re.compile(r'\x1b\[[0-9;:]*m')
+CTRL_RE = re.compile(r'[\x00-\x08\x0b-\x1a\x1c-\x1f\x7f]')
+
+EMERGE_RE = re.compile(r'^>>> Emerging (binary )?\((\d+) of (\d+)\) (\S+)')
+INSTALL_RE = re.compile(r'^>>> Installing \((\d+) of (\d+)\) (\S+)')
+COMPLETED_RE = re.compile(r'^>>> Completed \((\d+) of (\d+)\) (\S+)')
+FAILED_RE = re.compile(r'^\s*\* ERROR: (\S+) failed')
+LOGFILE_RE = re.compile(r"'(/\S+/build\.log)'")
+JOBS_RE = re.compile(r'Jobs: \d+ of \d+ complete')
+JOBS_ARG_RE = re.compile(r'^(?:--jobs(?:$|=(?!1$))|-[A-Za-z]*j(?!1$))')
+PLANNED_RE = re.compile(r'^\[(?:ebuild|binary)\s[^\]]*\]\s+(\S+/\S+)')
+PLANNED_HEADER = 'These are the packages that would be'
+STEP_RE = re.compile(r'\[\s*(\d+)\s*/\s*(\d+)\s*\]')
+PCT_RE = re.compile(r'\[\s*(\d{1,3})%\s*\]')
+IMPORTANT_RE = re.compile(r'^\s*\*\s|QA Notice|^!!!|(?:^|[^a-z])error:|\*\*\*.*\bError \d+', re.I)
+WARN_RE = re.compile(r'(?:^|[^a-z])warning:', re.I)
+ERR_RE = re.compile(r'(?:^|[^a-z])error:|\*\*\*.*\bError \d+', re.I)
+# Phase lines emerge prints with --quiet-build=n. "Installing" is src_install
+# into the image directory; "Merging" is copying the image onto the system.
+PHASES = [(re.compile(p), name) for p, name in (
+    (r'^>>> Running pre-merge checks', 'Checking'),
+    (r'^>>> (?:Downloading|Fetching)', 'Downloading'),
+    (r'^>>> Unpacking', 'Unpacking'),
+    (r'^>>> Preparing', 'Preparing'),
+    (r'^>>> Configuring', 'Configuring'),
+    (r'^>>> Compiling', 'Building'),
+    (r'^>>> Test phase:', 'Testing'),
+    (r'^>>> Install ', 'Installing'),
+    (r'^>>> Merging', 'Merging'),
+    (r'^>>> Safely unmerging', 'Unmerging'),
+    (r'^>>> Extracting (?!info)', 'Extracting'),
+)]
+# Without phase lines (quiet builds, --jobs), the phase is read from the marker
+# files Portage leaves in the build directory: the newest one present says
+# which phase comes next.
+BUILD_MARKERS = [
+    ('.installed', 'Merging'),
+    ('.tested', 'Installing'),
+    ('.compiled', 'Installing'),
+    ('.configured', 'Building'),
+    ('.prepared', 'Configuring'),
+    ('.unpacked', 'Preparing'),
+]
+PHASE_ORDER = {name: i for i, name in enumerate(
+    ['Starting', 'Checking', 'Downloading', 'Unpacking', 'Preparing', 'Configuring',
+     'Building', 'Testing', 'Installing', 'Merging', 'Unmerging'])}
+# Eclasses whose builds run ninja, which prints [N/M] step counts.
+STEP_ECLASSES = {'cmake', 'cmake-multilib', 'meson', 'meson-multilib', 'ninja-utils'}
+
+VERSION_RE = re.compile(r'-\d+(?:\.\d+)*[a-z]?(?:_(?:alpha|beta|pre|rc|p)\d*)*(?:-r\d+)?$')
+LOG_RE = re.compile(r'^(\d+):\s+(>>> emerge|::: completed emerge) \(\d+ of \d+\) (\S+) to ')
+
+
+def strip_ansi(s):
+    return CTRL_RE.sub('', ANSI_RE.sub('', s))
+
+
+def sanitize(s):
+    """Keep colours, drop cursor movement and other control sequences."""
+    return CTRL_RE.sub('', ANSI_RE.sub(lambda m: m[0] if SGR_RE.fullmatch(m[0]) else '', s))
+
+
+def cpv_of(atom):
+    return atom.split('::', 1)[0]
+
+
+def pkg_key(cpv):
+    return VERSION_RE.sub('', cpv_of(cpv))
+
+
+def fmt(sec):
+    sec = int(max(0, sec))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f'{h}:{m:02}:{s:02}' if h else f'{m}:{s:02}'
+
+
+def ellipsize(s, n):
+    return s if len(s) <= n else (s[:n - 1] + '…' if n > 1 else '')
+
+
+def plural(n, word):
+    return f'{n} {word}' + ('' if n == 1 else 's')
+
+
+def term_size():
+    size = os.get_terminal_size(1)
+    return size.lines, size.columns
+
+
+def set_winsize(fd, rows, cols):
+    try:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', max(rows, 1), max(cols, 1), 0, 0))
+    except OSError:
+        pass
+
+
+def load_history(path=EMERGE_LOG):
+    """Average duration, in seconds, of recent builds of each cat/pkg."""
+    starts = {}
+    runs = collections.defaultdict(lambda: collections.deque(maxlen=HISTORY_RUNS))
+    try:
+        with open(path, 'rb') as f:
+            for raw in f:
+                if b'emerge (' not in raw:
+                    continue
+                m = LOG_RE.match(raw.decode('utf-8', 'replace'))
+                if not m:
+                    continue
+                t, kind, cpv = int(m[1]), m[2], m[3]
+                if kind.startswith('>>>'):
+                    starts[cpv] = t
+                elif cpv in starts:
+                    runs[pkg_key(cpv)].append(t - starts.pop(cpv))
+    except OSError:
+        return {}
+    return {k: sum(v) / len(v) for k, v in runs.items()}
+
+
+class Metadata:
+    """Looks things up off the main thread, so the display never stalls.
+
+    history:  cat/pkg -> average build seconds (from emerge.log)
+    buildsys: cpv -> 'steps' if the build will print [N/M] counts, else 'none'
+    """
+
+    def __init__(self):
+        self.history = None
+        self.buildsys = {}
+        self.tmpdir = '/var/tmp'
+        self.requests = queue.Queue()
+        threading.Thread(target=self._load_history, daemon=True).start()
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def request(self, cpv, repo):
+        self.requests.put((cpv, repo))
+
+    def _load_history(self):
+        self.history = load_history()
+
+    def _serve(self):
+        try:
+            import portage
+            portdb = portage.db[portage.root]['porttree'].dbapi
+            self.tmpdir = portage.settings.get('PORTAGE_TMPDIR', self.tmpdir)
+        except Exception:
+            portdb = None
+        while True:
+            cpv, repo = self.requests.get()
+            if cpv not in self.buildsys:
+                self.buildsys[cpv] = self._buildsys(portdb, cpv, repo)
+
+    @staticmethod
+    def _buildsys(portdb, cpv, repo):
+        inherited = None
+        if portdb is not None:
+            try:
+                inherited = portdb.aux_get(cpv, ['INHERITED'], myrepo=repo)[0]
+            except Exception:
+                pass
+        if inherited is None:
+            # Fall back to what the installed version inherited.
+            key = pkg_key(cpv)
+            for path in glob.glob(f'/var/db/pkg/{key}-*/INHERITED'):
+                if pkg_key(os.path.basename(os.path.dirname(path))) == key.split('/')[1]:
+                    with open(path) as f:
+                        inherited = f.read()
+                    break
+        if inherited is None:
+            return None
+        return 'steps' if STEP_ECLASSES & set(inherited.split()) else 'none'
+
+
+class Styles:
+    # name: (truecolor start, truecolor end, 256-colour fallback)
+    GRADIENTS = {
+        'pkg': ((64, 160, 255), (80, 220, 140), 43),
+        'all': ((140, 120, 255), (210, 120, 230), 141),
+        'fail': ((230, 90, 90), (230, 90, 90), 167),
+    }
+
+    def __init__(self, on, truecolor):
+        self.on, self.tc = on, truecolor
+
+        def esc(code):
+            return f'\x1b[{code}m' if on else ''
+        self.reset, self.bold, self.dim = esc(0), esc(1), esc(2)
+        self.red, self.green, self.yellow, self.cyan = esc(31), esc(32), esc(33), esc(36)
+        self.track = (60, 60, 60) if truecolor else 237
+
+    def colour(self, name, t):
+        start, end, c256 = self.GRADIENTS[name]
+        if not self.tc:
+            return c256
+        return tuple(round(a + (b - a) * t) for a, b in zip(start, end))
+
+    def fg(self, c):
+        return self._sgr(38, c)
+
+    def bg(self, c):
+        return self._sgr(48, c)
+
+    def _sgr(self, layer, c):
+        if not self.on:
+            return ''
+        if isinstance(c, tuple):
+            return f'\x1b[{layer};2;{c[0]};{c[1]};{c[2]}m'
+        return f'\x1b[{layer};5;{c}m'
+
+
+class Pkg:
+    """One package being built, and its progress within the build."""
+
+    def __init__(self, cpv, idx, now, binary):
+        self.cpv, self.idx, self.start = cpv, idx, now
+        self.binary = binary
+        self.end = None
+        self.phase = 'Starting'
+        self.phase_from_output = False   # emerge prints phase lines for this build
+        self.failed = False
+        self.kind = None          # 'steps' for [N/M], 'pct' for [ NN%]
+        self.run = 0              # build system runs seen (multilib: one per ABI)
+        self.cur = self.total = 0
+        self.first = None         # (time, cur) of the first marker in this run
+        self.samples = collections.deque()
+        self.eta = None           # seconds left as of self.eta_at
+        self.eta_at = 0.0
+
+    @property
+    def done(self):
+        return self.end is not None
+
+    def update(self, cur, total, now, kind):
+        # A new build system run (e.g. the second ABI of a multilib build)
+        # starts counting again, so start the rate estimate afresh.
+        if kind != self.kind or total != self.total or cur < self.cur:
+            self.first, self.eta = (now, cur), None
+            self.samples.clear()
+            self.run += 1
+        self.kind, self.cur, self.total = kind, cur, total
+        self.samples.append((now, cur))
+        while len(self.samples) > 2 and now - self.samples[0][0] > RATE_WINDOW:
+            self.samples.popleft()
+        if self.eta is not None and now - self.eta_at < 1:
+            return
+        # Average the recent rate with the rate since the first marker: the
+        # first reacts to fast and slow stretches, the second keeps it steady.
+        rates = [(cur - c) / (now - t) for t, c in (self.samples[0], self.first)
+                 if now - t >= 2 and cur > c]
+        if not rates:
+            return
+        estimate = (total - cur) / (sum(rates) / len(rates))
+        shown = self.marker_left(now)
+        self.eta = estimate if shown is None else 0.3 * estimate + 0.7 * shown
+        self.eta_at = now
+
+    def marker_left(self, now):
+        return None if self.eta is None else max(0.0, self.eta - (now - self.eta_at))
+
+    def fraction(self):
+        """Measured progress of the current build system run, if it reports any."""
+        if self.done:
+            return 1.0
+        if self.total:
+            return self.cur / self.total
+        return None
+
+    def remaining(self, now, avg):
+        """Best guess at seconds left, for the overall ETA: the [N/M] rate when
+        there is one, else the usual build time minus time spent so far."""
+        if self.done:
+            return 0.0
+        left = self.marker_left(now) if self.total else None
+        if left is None and avg:
+            left = max(0.0, avg - (now - self.start))
+        return left
+
+
+class Progress:
+    def __init__(self, cmd, full, warnings, colour):
+        self.cmd = cmd
+        self.full = full
+        self.show_warnings = warnings
+        self.st = Styles(colour, os.environ.get('COLORTERM', '') in ('truecolor', '24bit'))
+        self.obuf = []
+        self.rows, self.cols = term_size()
+        self.winch = False
+        self.panel = False
+        self.panel_done = False   # the panel is shown at most once per run
+        self.height = 0
+        self.decoder = codecs.getincrementaldecoder('utf-8')('replace')
+        self.pt_line = b''        # current line while passing output through
+        self.buf = ''             # unfinished line while the panel is up
+        self.recent = collections.deque(maxlen=CONTEXT_LINES)   # (line, was it hidden)
+        self.meta = None
+        self.exit_code = None
+        self.title = None
+        self.last_draw = self.last_poll = 0.0
+        self.t0 = time.time()
+        # What emerge is doing
+        self.n_total = 0
+        self.n_emerging = 0
+        self.planned = []
+        self.started = set()
+        self.active = {}
+        self.current = None
+        self.last = None
+        self.completed = 0
+        self.failed = []          # [cpv, build log path or None]
+        self.durations = []
+        self.jobs_mode = any(JOBS_ARG_RE.match(a) for a in cmd[1:])
+        self.max_active = 1
+        self.warnings = self.errors = 0
+
+    # --- process and terminal plumbing ---
+
+    def run(self):
+        self.saved_tc = termios.tcgetattr(0)
+        self.spawn()
+        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT, signal.SIGQUIT):
+            signal.signal(sig, self.forward_signal)
+        signal.signal(signal.SIGWINCH, lambda *_: setattr(self, 'winch', True))
+        self.meta = Metadata()   # after the fork: the child needn't share its threads
+        self.out('\x1b[22;0t')   # push the window title
+        try:
+            self.raw_tty()
+            self.loop()
+            _, status = os.waitpid(self.pid, 0)
+            self.pid = None
+            self.exit_code = os.waitstatus_to_exitcode(status)
+            if self.exit_code == 0:
+                for cpv in list(self.active):
+                    self.finish_pkg(cpv, time.time())
+            return self.exit_code
+        finally:
+            if self.pid:
+                self.forward_signal(signal.SIGTERM)
+                os.waitpid(self.pid, 0)
+            if self.panel:
+                self.leave_panel()
+            termios.tcsetattr(0, termios.TCSADRAIN, self.saved_tc)
+            # Fallback title for terminals without a title stack, then pop it.
+            home = os.path.expanduser('~')
+            cwd = os.getcwd()
+            cwd = '~' + cwd[len(home):] if cwd.startswith(home) else cwd
+            self.out(f'\x1b[?25h\x1b]0;{os.environ.get("USER", "")}@{os.uname().nodename.split(".")[0]}:{cwd}\x07\x1b[23;0t')
+            self.flush()
+
+    def spawn(self):
+        master, slave = os.openpty()
+        termios.tcsetattr(slave, termios.TCSANOW, self.saved_tc)
+        set_winsize(slave, self.rows, self.cols)
+        pid = os.fork()
+        if pid == 0:
+            try:
+                os.close(master)
+                os.setsid()
+                fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+                for fd in (0, 1, 2):
+                    os.dup2(slave, fd)
+                if slave > 2:
+                    os.close(slave)
+                signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+                os.execvp(self.cmd[0], self.cmd)
+            except OSError as e:
+                os.write(2, f'emergep: {self.cmd[0]}: {e.strerror}\r\n'.encode())
+            os._exit(127)
+        os.close(slave)
+        self.master, self.pid = master, pid
+
+    def raw_tty(self):
+        # Keys go to the pty, whose own line discipline echoes them and turns
+        # Ctrl-C into SIGINT for emerge. Output processing stays on.
+        mode = termios.tcgetattr(0)
+        mode[0] &= ~(termios.BRKINT | termios.ICRNL | termios.INPCK | termios.ISTRIP | termios.IXON)
+        mode[3] &= ~(termios.ECHO | termios.ICANON | termios.IEXTEN | termios.ISIG)
+        mode[6][termios.VMIN], mode[6][termios.VTIME] = 1, 0
+        termios.tcsetattr(0, termios.TCSAFLUSH, mode)
+
+    def forward_signal(self, sig, frame=None):
+        if self.pid:
+            try:
+                os.kill(self.pid, sig)
+            except OSError:
+                pass
+
+    def loop(self):
+        self.sel = selectors.DefaultSelector()
+        self.sel.register(self.master, selectors.EVENT_READ, self.on_pty)
+        self.sel.register(0, selectors.EVENT_READ, self.on_keys)
+        self.eof = False
+        while not self.eof:
+            for key, _ in self.sel.select(TICK):
+                key.data(key.fd)
+            if self.winch:
+                self.on_resize()
+            now = time.time()
+            if self.panel and now - self.last_poll >= POLL_PHASE:
+                self.poll_phases()
+                self.last_poll = now
+            if self.panel and now - self.last_draw >= TICK:
+                self.draw()
+            self.flush()
+        if self.panel and self.buf:
+            self.panel_line(self.buf)
+            self.buf = ''
+
+    def on_pty(self, fd):
+        try:
+            data = os.read(fd, 65536)
+        except OSError:   # EIO once emerge and its children have exited
+            data = b''
+        if not data:
+            self.eof = True
+            return
+        self.feed(data)
+
+    def on_keys(self, fd):
+        try:
+            data = os.read(fd, 1024)
+        except OSError:
+            data = b''
+        if not data:
+            self.sel.unregister(fd)
+            return
+        data = data.replace(b'\x1a', b'')   # Ctrl-Z would stop emerge with no way back
+        if not self.panel:
+            self.write_pty(data)
+            return
+        for b in data:
+            if b == 0x20:
+                self.toggle_full()
+            elif b in (0x03, 0x1c):   # Ctrl-C, Ctrl-\
+                self.write_pty(bytes([b]))
+
+    def write_pty(self, data):
+        try:
+            os.write(self.master, data)
+        except OSError:
+            pass
+
+    def out(self, s):
+        self.obuf.append(s.encode('utf-8', 'replace'))
+
+    def flush(self):
+        if not self.obuf:
+            return
+        data = b''.join(self.obuf)
+        self.obuf = []
+        try:
+            while data:
+                data = data[os.write(1, data):]
+        except OSError:
+            pass
+
+    def log(self, s):
+        self.out(s + self.st.reset + '\n')
+
+    # --- reading emerge's output ---
+
+    def feed(self, data):
+        if self.panel:
+            self.feed_panel(self.decoder.decode(data))
+        else:
+            self.feed_passthrough(data)
+        if (self.panel and self.n_total and not self.active
+                and self.completed + len(self.failed) >= self.n_total):
+            self.leave_panel()
+
+    def feed_passthrough(self, data):
+        start = 0
+        while (nl := data.find(b'\n', start)) >= 0:
+            self.obuf.append(data[start:nl + 1])
+            line, self.pt_line = self.pt_line + data[start:nl + 1], b''
+            start = nl + 1
+            if self.passthrough_line(line.decode('utf-8', 'replace')):
+                self.feed_panel(self.decoder.decode(data[start:]))
+                return
+        self.obuf.append(data[start:])
+        self.pt_line = (self.pt_line + data[start:])[-8192:]
+
+    def passthrough_line(self, text):
+        """Watch for the package list and the first build; True once the panel is up."""
+        plain = visible_plain(text)
+        if plain.startswith(PLANNED_HEADER):
+            self.planned = []
+        elif m := PLANNED_RE.match(plain):
+            self.planned.append(cpv_of(m[1]))
+        elif EMERGE_RE.match(plain) and not self.panel_done:
+            self.event(plain)
+            return self.enter_panel()
+        return False
+
+    def feed_panel(self, text):
+        self.buf += text
+        *lines, self.buf = self.buf.split('\n')
+        for line in lines:
+            self.panel_line(line)
+        # Text rewritten in place with \r (emerge's "Jobs:" line) never gets a
+        # newline; read its earlier states as they come. A trailing \r may be
+        # the first half of \r\n, so leave that one for the next read.
+        cut = self.buf.rfind('\r', 0, len(self.buf) - 1)
+        if cut >= 0:
+            for seg in self.buf[:cut].split('\r'):
+                self.event(strip_ansi(seg))
+            self.buf = self.buf[cut + 1:]
+        self.buf = self.buf[-65536:]
+
+    def panel_line(self, raw):
+        shown, plain = '', ''
+        for seg in raw.rstrip('\r').split('\r'):
+            p = strip_ansi(seg)
+            self.event(p)
+            if p.strip():
+                shown, plain = seg, p
+        if not plain:
+            if self.full:
+                self.log('')
+            return
+        if JOBS_RE.search(plain):
+            return
+        if WARN_RE.search(plain):
+            self.warnings += 1
+        if ERR_RE.search(plain):
+            self.errors += 1
+        if FAILED_RE.match(plain) and any(hidden for _, hidden in self.recent):
+            # Replay the build output leading up to the failure, in order.
+            self.log(f'{self.st.dim}── last lines of build output ──')
+            for line, _ in self.recent:
+                self.log(self.st.dim + line)
+            self.log(f'{self.st.dim}──')
+            self.recent.clear()
+        hide = not (self.full or plain.startswith('>>>') or IMPORTANT_RE.search(plain)
+                    or (self.show_warnings and WARN_RE.search(plain)))
+        if not plain.startswith('>>>'):
+            self.recent.append((plain, hide))
+        if hide:
+            return
+        if EMERGE_RE.match(plain) and self.n_emerging > 1:
+            self.log('')
+        self.log(sanitize(shown))
+
+    def event(self, p):
+        """Update the build state from one line (or \r segment) of output."""
+        now = time.time()
+        if m := EMERGE_RE.match(p):
+            self.start_pkg(int(m[2]), int(m[3]), m[4], bool(m[1]), now)
+        elif m := COMPLETED_RE.match(p):
+            self.finish_pkg(cpv_of(m[3]), now)
+        elif m := INSTALL_RE.match(p):
+            # Despite the wording, this is the merge onto the live system.
+            if pkg := self.active.get(cpv_of(m[3])):
+                pkg.phase = 'Merging'
+        elif m := FAILED_RE.match(p):
+            self.fail_pkg(cpv_of(m[1]), now)
+        elif (m := LOGFILE_RE.search(p)) and self.failed and not self.failed[-1][1]:
+            self.failed[-1][1] = m[1]
+        elif p.startswith('>>> '):
+            if self.current:
+                for rx, name in PHASES:
+                    if rx.match(p):
+                        self.current.phase = name
+                        self.current.phase_from_output = True
+                        break
+        elif JOBS_RE.search(p):
+            self.jobs_mode = True
+        elif self.current and not self.current.done:
+            steps = [m for m in STEP_RE.finditer(p) if 0 < int(m[1]) <= int(m[2]) and int(m[2]) >= MIN_STEPS]
+            if steps:
+                self.current.update(int(steps[-1][1]), int(steps[-1][2]), now, 'steps')
+            elif pcts := [m for m in PCT_RE.finditer(p) if 0 < int(m[1]) <= 100]:
+                self.current.update(int(pcts[-1][1]), 100, now, 'pct')
+
+    def start_pkg(self, idx, total, atom, binary, now):
+        if not self.jobs_mode:
+            # Building one at a time: a new package means the last one, if it
+            # got as far as installing, has finished.
+            for other, pkg in list(self.active.items()):
+                if pkg.phase in ('Installing', 'Merging', 'Unmerging'):
+                    self.finish_pkg(other, now)
+        cpv, _, repo = atom.partition('::')
+        self.n_total = total
+        self.n_emerging += 1
+        pkg = Pkg(cpv, idx, now, binary)
+        self.active[cpv] = self.current = pkg
+        self.started.add(cpv)
+        if not binary:
+            self.meta.request(cpv, repo or None)
+        if len(self.active) > self.max_active:
+            self.max_active = len(self.active)
+            if self.panel:
+                self.set_region(self.panel_height())
+
+    def finish_pkg(self, cpv, now):
+        if pkg := self.active.pop(cpv, None):
+            self.completed += 1
+            self.durations.append(now - pkg.start)
+            pkg.end, pkg.phase = now, 'Done'
+            self.retire(pkg)
+
+    def fail_pkg(self, cpv, now):
+        # emerge repeats the error in its end-of-run messages; count it once.
+        if any(c == cpv for c, _ in self.failed):
+            return
+        self.failed.append([cpv, None])
+        if pkg := self.active.pop(cpv, None):
+            pkg.end, pkg.phase, pkg.failed = now, 'Failed', True
+            self.retire(pkg)
+
+    def retire(self, pkg):
+        self.last = pkg
+        if self.current is pkg:
+            self.current = next(reversed(self.active.values()), None)
+
+    def avg_for(self, pkg):
+        return (self.meta.history or {}).get(pkg_key(pkg.cpv))
+
+    def poll_phases(self):
+        """Phase from Portage's marker files, for builds that print no phase lines."""
+        for pkg in self.active.values():
+            if pkg.phase_from_output or pkg.binary:
+                continue
+            builddir = os.path.join(self.meta.tmpdir, 'portage', pkg.cpv)
+            for marker, phase in BUILD_MARKERS:
+                if os.path.exists(os.path.join(builddir, marker)):
+                    # Never step back, e.g. from emerge's own "Merging".
+                    if PHASE_ORDER.get(phase, 0) > PHASE_ORDER.get(pkg.phase, 0):
+                        pkg.phase = phase
+                    break
+
+    def overall_eta(self, now):
+        hist = self.meta.history or {}
+        known = [d for d in (hist.get(pkg_key(c)) for c in self.planned) if d]
+        fallback = (statistics.median(known) if known
+                    else statistics.mean(self.durations) if self.durations else None)
+        if len(self.planned) == self.n_total:
+            pending = [hist.get(pkg_key(c), fallback) for c in self.planned if c not in self.started]
+        else:
+            pending = [fallback] * max(0, self.n_total - len(self.started))
+        left = [p.remaining(now, self.avg_for(p)) for p in self.active.values()]
+        if None in pending or None in left:
+            return None
+        parallel = max(1, len(self.active)) if self.jobs_mode else 1
+        return sum(pending) / parallel + max(left, default=0.0)
+
+    # --- the panel ---
+
+    def panel_height(self):
+        return 1 + 2 * min(MAX_SLOTS, self.max_active) + (1 if self.n_total > 1 else 0)
+
+    def enter_panel(self):
+        h = self.panel_height()
+        if self.rows < h + 3:
+            return False
+        self.panel = True
+        self.t0 = time.time()
+        for cpv in self.planned:   # look up the rest of the list in advance
+            self.meta.request(cpv, None)
+        self.out('\x1b[?25l')
+        self.set_region(h)
+        return True
+
+    def set_region(self, h):
+        """Reserve the bottom h rows for the panel and scroll the log above it."""
+        self.height = h
+        top = self.rows - h
+        # Scroll the screen up to make room (when the cursor is near the
+        # bottom), then limit scrolling to the rows above the panel.
+        self.out('\x1b7\x1b[r\x1b8' + '\n' * h + f'\x1b[{h}A\x1b7\x1b[1;{top}r\x1b8')
+        set_winsize(self.master, top, self.cols)
+        self.draw()
+
+    def leave_panel(self):
+        top = self.rows - self.height
+        if self.buf:
+            self.out(self.buf)
+            self.buf = ''
+        self.out(f'\x1b7\x1b[{top + 1};1H\x1b[J\x1b[r\x1b8\x1b[?25h')
+        self.panel, self.panel_done = False, True
+        set_winsize(self.master, self.rows, self.cols)
+        self.summary()
+
+    def on_resize(self):
+        self.winch = False
+        self.rows, self.cols = term_size()
+        if not self.panel:
+            set_winsize(self.master, self.rows, self.cols)
+            return
+        top = self.rows - self.height
+        self.out(f'\x1b[r\x1b[{top};1H\x1b[J\x1b[1;{top}r\x1b[{top};1H')
+        set_winsize(self.master, top, self.cols)
+        self.draw()
+
+    def toggle_full(self):
+        self.full = not self.full
+        note = 'showing full build output' if self.full else 'showing important lines only'
+        self.log(f'{self.st.dim}── {note} (space to switch) ──')
+        self.draw()
+
+    def draw(self):
+        now = time.time()
+        lines = self.panel_lines(now)
+        top = self.rows - self.height
+        parts = ['\x1b7']
+        for i in range(self.height):
+            parts.append(f'\x1b[{top + 1 + i};1H\x1b[2K')
+            if i < len(lines):
+                parts.append(lines[i] + self.st.reset)
+        parts.append('\x1b8')
+        if pkg := self.current or self.last:
+            title = f'emerge ({pkg.idx}/{self.n_total}) {pkg.cpv} · {pkg.phase}'
+            if title != self.title:
+                self.title = title
+                parts.append(f'\x1b]0;{title}\x07')
+        self.out(''.join(parts))
+        self.last_draw = now
+
+    def panel_lines(self, now):
+        slots = min(MAX_SLOTS, self.max_active)
+        pkgs = list(self.active.values())[-slots:] or ([self.last] if self.last else [])
+        eta = self.overall_eta(now) if self.n_total > 1 else None
+        lines = [self.separator(now, eta, len(self.active) - len(pkgs))]
+        for i in range(slots):
+            if i < len(pkgs):
+                lines += [self.header_line(pkgs[i], now), self.pkg_bar(pkgs[i], now)]
+            else:
+                lines += ['', '']
+        if self.n_total > 1:
+            lines.append(self.overall_bar(now, eta))
+        return lines
+
+    def separator(self, now, eta, more):
+        S = self.st
+        bits = []
+        if more > 0:
+            bits.append((f'+{more} more', S.cyan))
+        if self.warnings:
+            bits.append((plural(self.warnings, 'warning'), S.yellow))
+        if self.errors:
+            bits.append((plural(self.errors, 'error'), S.red))
+        if eta is not None:
+            bits.append(('done ≈ ' + time.strftime('%H:%M', time.localtime(now + eta)), ''))
+        bits.append(('space: ' + ('important only' if self.full else 'full log'), S.dim))
+        w = self.cols - 1
+        while bits:
+            text_w = sum(len(t) for t, _ in bits) + 3 * (len(bits) - 1) + 2
+            if w - text_w - 2 >= 2:
+                break
+            bits.pop(0)
+        if not bits:
+            return S.dim + '─' * w
+        joined = f'{S.reset}{S.dim} · {S.reset}'.join(f'{style}{t}{S.reset}' for t, style in bits)
+        return f'{S.dim}{"─" * (w - text_w - 2)} {S.reset}{joined}{S.dim} ──'
+
+    def header_line(self, pkg, now):
+        S = self.st
+        if pkg.failed:
+            icon, icon_style, phase_style = '✖', S.red, S.red
+        elif pkg.done:
+            icon, icon_style, phase_style = '✔', S.green, S.green
+        else:
+            icon, icon_style, phase_style = SPINNER[int(now * 10) % len(SPINNER)], S.cyan, S.yellow
+        w = self.cols - 1
+        count = f'({pkg.idx}/{self.n_total})'
+        fixed = 3 + len(count) + 1 + len(pkg.phase)
+        name = ellipsize(pkg.cpv, w - fixed - 1)
+        pad = max(1, w - fixed - len(name))
+        return (f' {icon_style}{icon}{S.reset} {S.dim}{count}{S.reset} {S.bold}{name}{S.reset}'
+                f'{" " * pad}{phase_style}{pkg.phase}{S.reset}')
+
+    def pkg_bar(self, pkg, now):
+        elapsed = fmt((pkg.end or now) - pkg.start)
+        grad = 'fail' if pkg.failed else 'pkg'
+        frac = pkg.fraction()
+        if pkg.done or frac is None:
+            # Nothing measured: a moving block, plus the usual build time to
+            # compare the elapsed time against.
+            avg = self.avg_for(pkg)
+            if pkg.done:
+                detail = ''
+            elif avg:
+                detail = f'usually {fmt(avg)}'
+            elif pkg.binary:
+                detail = 'binary package'
+            elif self.meta.buildsys.get(pkg.cpv) == 'none':
+                detail = 'no step counts'
+            else:
+                detail = ''
+            return self.bar_line(1.0 if pkg.done else None, grad, now, '', detail, elapsed, '')
+        run = f'#{pkg.run} ' if pkg.run > 1 else ''
+        detail = run + (f'{pkg.cur}/{pkg.total}' if pkg.kind == 'steps' else '')
+        left = pkg.marker_left(now)
+        return self.bar_line(frac, grad, now, f'{int(frac * 100)}%', detail, elapsed,
+                             '~' + fmt(left) if left is not None else '')
+
+    def overall_bar(self, now, eta):
+        done = self.completed + len(self.failed)
+        # A finished ninja run still leaves installing and merging to do.
+        partial = sum(min(p.fraction() or 0, 0.99) for p in self.active.values())
+        frac = min(1.0, (done + partial) / self.n_total)
+        return self.bar_line(
+            frac, 'all', now, f'{int(frac * 100)}%', f'{done}/{self.n_total} pkgs',
+            fmt(now - self.t0), '~' + fmt(eta) if eta is not None else '')
+
+    def bar_line(self, frac, grad, now, pct, detail, t1, t2):
+        S = self.st
+        w = self.cols - 1
+        bw = w - 3 - STATS_W - 1
+        if bw < 10:
+            return '   ' + self.bar(frac, max(4, w - 3), grad, now)
+        return (f'   {self.bar(frac, bw, grad, now)} {S.bold}{pct:>4}{S.reset}  '
+                f'{S.dim}{detail:<{DETAIL_W}}{S.reset}{t1:>9}{S.cyan}{t2:>9}{S.reset}')
+
+    def bar(self, frac, width, grad, now):
+        S = self.st
+        if frac is None:
+            # No progress information: sweep a block across to show it's alive.
+            pos = int(now * 12) % (width + SWEEP) - SWEEP
+            full, part = -1, 0
+
+            def lit(i):
+                return pos <= i < pos + SWEEP
+        else:
+            cells = min(max(frac, 0.0), 1.0) * width
+            full, part = int(cells), int((cells - int(cells)) * 8)
+
+            def lit(i):
+                return i < full
+        if not S.on:
+            return ''.join('█' if lit(i) else EIGHTHS[part] if i == full and part else '░'
+                           for i in range(width))
+        out, prev = [], None
+        for i in range(width):
+            c = S.colour(grad, i / max(1, width - 1))
+            if lit(i):
+                code, ch = S.fg(c), '█'
+            elif i == full and part:
+                code, ch = S.fg(c) + S.bg(S.track), EIGHTHS[part]
+            else:
+                code, ch = S.fg(S.track) + S.bg(S.track), '█'
+            if code != prev:
+                out.append(code)
+                prev = code
+            out.append(ch)
+        return ''.join(out) + S.reset
+
+    def summary(self):
+        S = self.st
+        parts = [f'{S.green}✔ {self.completed} merged{S.reset}']
+        if self.failed:
+            parts.append(f'{S.red}✖ {len(self.failed)} failed{S.reset}')
+        if self.warnings:
+            parts.append(f'{S.yellow}{plural(self.warnings, "warning")}{S.reset}')
+        parts.append(f'{S.dim}in {fmt(time.time() - self.t0)}{S.reset}')
+        self.log('\n' + '   '.join(parts))
+        for cpv, path in self.failed:
+            self.log(f'  {S.red}✖{S.reset} {cpv}' + (f'  {S.dim}{path}' if path else ''))
+        if self.exit_code not in (None, 0) and not self.failed:
+            self.log(f'{S.red}emerge exited with status {self.exit_code}')
+
+
+def visible_plain(text):
+    """What a terminal would show for a line: the last non-blank \r segment."""
+    for seg in reversed(text.rstrip('\r\n').split('\r')):
+        if (p := strip_ansi(seg)).strip():
+            return p
+    return ''
+
+
+def main(argv):
+    full, warnings, colour = False, False, True
+    args = list(argv)
+    while args:
+        a = args[0]
+        if a == '--':
+            args.pop(0)
+            break
+        if not a.startswith('--ep-'):
+            break
+        args.pop(0)
+        if a == '--ep-full':
+            full = True
+        elif a == '--ep-warnings':
+            warnings = True
+        elif a == '--ep-no-color':
+            colour = False
+        elif a == '--ep-help':
+            print(USAGE, end='')
+            return 0
+        else:
+            sys.stderr.write(f'emergep: unknown option {a}\n\n{USAGE}')
+            return 2
+    if 'NO_COLOR' in os.environ:
+        colour = False
+    cmd = ['emerge'] + ([] if colour else ['--color=n']) + args
+    if not (os.isatty(0) and os.isatty(1)):
+        os.execvp(cmd[0], cmd)   # not interactive: nothing to draw, just be emerge
+    return Progress(cmd, full, warnings, colour).run()
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
