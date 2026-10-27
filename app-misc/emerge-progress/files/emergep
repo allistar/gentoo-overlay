@@ -42,9 +42,12 @@ Runs emerge with the build log scrolling above a progress panel pinned to the
 bottom of the terminal. Options for this script start with --ep- so they never
 collide with emerge's own options.
 
-Build output is filtered to Portage's messages (>>>, *, !!!, QA Notice) and
-errors. Compiler and configure warnings are counted in the panel but hidden;
-Portage itself reports the ones that matter as a QA Notice.
+Build output is filtered to the lines starting and finishing each package,
+Portage's warnings and errors (ewarn, eerror, QA Notice, !!!) and build errors.
+Phase lines and einfo messages are hidden: the panel shows the phase, and
+Portage repeats elog messages at the end of the run. Compiler and configure
+warnings are counted in the panel but hidden; Portage itself reports the ones
+that matter as a QA Notice.
 
   --ep-full       start by showing the full build output
   --ep-warnings   also show compiler and configure warnings
@@ -77,6 +80,7 @@ EIGHTHS = ' ▏▎▍▌▋▊▉'
 
 ANSI_RE = re.compile(r'\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[()][0-9A-Za-z]|[@-Z\\-_])')
 SGR_RE = re.compile(r'\x1b\[[0-9;:]*m')
+SGR_BYTES_RE = re.compile(rb'\x1b\[[0-9;:]*m')
 CTRL_RE = re.compile(r'[\x00-\x08\x0b-\x1a\x1c-\x1f\x7f]')
 
 EMERGE_RE = re.compile(r'^>>> Emerging (binary )?\((\d+) of (\d+)\) (\S+)')
@@ -90,7 +94,13 @@ PLANNED_RE = re.compile(r'^\[(?:ebuild|binary)\s[^\]]*\]\s+(\S+/\S+)')
 PLANNED_HEADER = 'These are the packages that would be'
 STEP_RE = re.compile(r'\[\s*(\d+)\s*/\s*(\d+)\s*\]')
 PCT_RE = re.compile(r'\[\s*(\d{1,3})%\s*\]')
-IMPORTANT_RE = re.compile(r'^\s*\*\s|QA Notice|^!!!|(?:^|[^a-z])error:|\*\*\*.*\bError \d+', re.I)
+IMPORTANT_RE = re.compile(r'QA Notice|^!!!|(?:^|[^a-z])error:|\*\*\*.*\bError \d+', re.I)
+# Portage message lines (" * ..."): einfo/elog are green, ewarn yellow, eerror
+# red, eqawarn brown. The colour in front of the * tells them apart.
+MESSAGE_RE = re.compile(r'^\s*\*(?:\s|$)')
+MESSAGE_COLOUR_RE = re.compile(r'^\s*((?:\x1b\[[0-9;]*m)+)\*')
+ALERT_STYLES = ('WARN', 'BAD', 'QAWARN')
+ALERT_SGR = {'\x1b[33;01m', '\x1b[31;01m', '\x1b[33m'}   # Portage's defaults for those
 WARN_RE = re.compile(r'(?:^|[^a-z])warning:', re.I)
 ERR_RE = re.compile(r'(?:^|[^a-z])error:|\*\*\*.*\bError \d+', re.I)
 # Phase lines emerge prints with --quiet-build=n. "Installing" is src_install
@@ -206,6 +216,7 @@ class Metadata:
         self.history = None
         self.buildsys = {}
         self.tmpdir = '/var/tmp'
+        self.alert_sgr = ALERT_SGR
         self.requests = queue.Queue()
         threading.Thread(target=self._load_history, daemon=True).start()
         threading.Thread(target=self._serve, daemon=True).start()
@@ -221,6 +232,8 @@ class Metadata:
             import portage
             portdb = portage.db[portage.root]['porttree'].dbapi
             self.tmpdir = portage.settings.get('PORTAGE_TMPDIR', self.tmpdir)
+            import portage.output   # honours /etc/portage/color.map
+            self.alert_sgr = {portage.output.style_to_ansi_code(s) for s in ALERT_STYLES}
         except Exception:
             portdb = None
         while True:
@@ -520,6 +533,12 @@ class Progress:
     def out(self, s):
         self.obuf.append(s.encode('utf-8', 'replace'))
 
+    def out_emerge(self, data):
+        """Pass emerge's own bytes on. emerge always colours its output (the
+        filter needs the colours to tell ewarn from einfo), so without colour
+        they're removed here."""
+        self.obuf.append(data if self.st.on else SGR_BYTES_RE.sub(b'', data))
+
     def flush(self):
         if not self.obuf:
             return
@@ -548,13 +567,13 @@ class Progress:
     def feed_passthrough(self, data):
         start = 0
         while (nl := data.find(b'\n', start)) >= 0:
-            self.obuf.append(data[start:nl + 1])
+            self.out_emerge(data[start:nl + 1])
             line, self.pt_line = self.pt_line + data[start:nl + 1], b''
             start = nl + 1
             if self.passthrough_line(line.decode('utf-8', 'replace')):
                 self.feed_panel(self.decoder.decode(data[start:]))
                 return
-        self.obuf.append(data[start:])
+        self.out_emerge(data[start:])
         self.pt_line = (self.pt_line + data[start:])[-8192:]
 
     def passthrough_line(self, text):
@@ -608,15 +627,26 @@ class Progress:
                 self.log(self.st.dim + line)
             self.log(f'{self.st.dim}──')
             self.recent.clear()
-        hide = not (self.full or plain.startswith('>>>') or IMPORTANT_RE.search(plain)
-                    or (self.show_warnings and WARN_RE.search(plain)))
+        hide = not (self.full or self.important(plain, shown))
         if not plain.startswith('>>>'):
             self.recent.append((plain, hide))
         if hide:
             return
         if EMERGE_RE.match(plain) and self.n_emerging > 1:
             self.log('')
-        self.log(sanitize(shown))
+        self.log(sanitize(shown) if self.st.on else plain)
+
+    def important(self, plain, raw):
+        """Whether a line is shown when the build output is filtered."""
+        if plain.startswith('>>>'):
+            # Phases are in the panel; keep package boundaries and failures.
+            return bool(EMERGE_RE.match(plain) or COMPLETED_RE.match(plain)
+                        or plain.startswith('>>> Failed') or LOGFILE_RE.search(plain))
+        if MESSAGE_RE.match(plain):
+            # ewarn/eerror/eqawarn, not einfo. Uncoloured: can't tell, so keep.
+            m = MESSAGE_COLOUR_RE.match(raw)
+            return not m or any(code in m[1] for code in self.meta.alert_sgr)
+        return bool(IMPORTANT_RE.search(plain) or (self.show_warnings and WARN_RE.search(plain)))
 
     def event(self, p):
         """Update the build state from one line (or \r segment) of output."""
@@ -751,7 +781,7 @@ class Progress:
     def leave_panel(self):
         top = self.rows - self.height
         if self.buf:
-            self.out(self.buf)
+            self.out_emerge(self.buf.encode('utf-8', 'replace'))
             self.buf = ''
         self.out(f'\x1b7\x1b[{top + 1};1H\x1b[J\x1b[r\x1b8\x1b[?25h')
         self.panel, self.panel_done = False, True
@@ -970,7 +1000,7 @@ def main(argv):
             return 2
     if 'NO_COLOR' in os.environ:
         colour = False
-    cmd = ['emerge'] + ([] if colour else ['--color=n']) + args
+    cmd = ['emerge'] + args
     if not (os.isatty(0) and os.isatty(1)):
         os.execvp(cmd[0], cmd)   # not interactive: nothing to draw, just be emerge
     return Progress(cmd, full, warnings, colour).run()
