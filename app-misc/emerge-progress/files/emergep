@@ -94,15 +94,17 @@ PLANNED_RE = re.compile(r'^\[(?:ebuild|binary)\s[^\]]*\]\s+(\S+/\S+)')
 PLANNED_HEADER = 'These are the packages that would be'
 STEP_RE = re.compile(r'\[\s*(\d+)\s*/\s*(\d+)\s*\]')
 PCT_RE = re.compile(r'\[\s*(\d{1,3})%\s*\]')
-IMPORTANT_RE = re.compile(r'QA Notice|^!!!|(?:^|[^a-z])error:|\*\*\*.*\bError \d+', re.I)
 # Portage message lines (" * ..."): einfo/elog are green, ewarn yellow, eerror
 # red, eqawarn brown. The colour in front of the * tells them apart.
 MESSAGE_RE = re.compile(r'^\s*\*(?:\s|$)')
 MESSAGE_COLOUR_RE = re.compile(r'^\s*((?:\x1b\[[0-9;]*m)+)\*')
 ALERT_STYLES = ('WARN', 'BAD', 'QAWARN')
 ALERT_SGR = {'\x1b[33;01m', '\x1b[31;01m', '\x1b[33m'}   # Portage's defaults for those
-WARN_RE = re.compile(r'(?:^|[^a-z])warning:', re.I)
-ERR_RE = re.compile(r'(?:^|[^a-z])error:|\*\*\*.*\bError \d+', re.I)
+# Compiler diagnostics ("x.c:1:2: error:", rustc "error[E0308]:"), but not
+# words or paths that merely contain them ("thiserror:", "std::error::Error").
+WARN_RE = re.compile(r'(?<![\w:])warning(?:\[\w+\])?:(?!:)', re.I)
+ERR_RE = re.compile(r'(?<![\w:])error(?:\[\w+\])?:(?!:)|\*\*\*.*\bError \d+', re.I)
+IMPORTANT_RE = re.compile(rf'QA Notice|^!!!|{ERR_RE.pattern}', re.I)
 # Phase lines emerge prints with --quiet-build=n. "Installing" is src_install
 # into the image directory; "Merging" is copying the image onto the system.
 PHASES = [(re.compile(p), name) for p, name in (
