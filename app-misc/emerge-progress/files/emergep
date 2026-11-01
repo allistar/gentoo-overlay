@@ -105,6 +105,14 @@ ALERT_SGR = {'\x1b[33;01m', '\x1b[31;01m', '\x1b[33m'}   # Portage's defaults fo
 WARN_RE = re.compile(r'(?<![\w:])warning(?:\[\w+\])?:(?!:)', re.I)
 ERR_RE = re.compile(r'(?<![\w:])error(?:\[\w+\])?:(?!:)|\*\*\*.*\bError \d+', re.I)
 IMPORTANT_RE = re.compile(rf'QA Notice|^!!!|{ERR_RE.pattern}', re.I)
+# distcc reports its own failures as "distcc[pid] ... ERROR:", then compiles
+# the file locally, so the build carries on: a warning, not an error. mach
+# puts an elapsed time in front of each line.
+DISTCC_RE = re.compile(r'^\s*(?:\d+:\d\d\.\d\d\s+)?distcc\[\d+\]')
+
+
+def is_warning(plain):
+    return bool(DISTCC_RE.match(plain) or WARN_RE.search(plain))
 # Phase lines emerge prints with --quiet-build=n. "Installing" is src_install
 # into the image directory; "Merging" is copying the image onto the system.
 PHASES = [(re.compile(p), name) for p, name in (
@@ -618,9 +626,9 @@ class Progress:
             return
         if JOBS_RE.search(plain):
             return
-        if WARN_RE.search(plain):
+        if is_warning(plain):
             self.warnings += 1
-        if ERR_RE.search(plain):
+        if ERR_RE.search(plain) and not DISTCC_RE.match(plain):
             self.errors += 1
         if FAILED_RE.match(plain) and any(hidden for _, hidden in self.recent):
             # Replay the build output leading up to the failure, in order.
@@ -648,6 +656,8 @@ class Progress:
             # ewarn/eerror/eqawarn, not einfo. Uncoloured: can't tell, so keep.
             m = MESSAGE_COLOUR_RE.match(raw)
             return not m or any(code in m[1] for code in self.meta.alert_sgr)
+        if DISTCC_RE.match(plain):
+            return self.show_warnings
         return bool(IMPORTANT_RE.search(plain) or (self.show_warnings and WARN_RE.search(plain)))
 
     def event(self, p):
