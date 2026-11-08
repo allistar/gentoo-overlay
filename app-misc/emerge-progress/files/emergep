@@ -27,6 +27,7 @@ import codecs
 import collections
 import fcntl
 import glob
+import json
 import os
 import queue
 import re
@@ -73,6 +74,7 @@ Examples:
 
 EMERGE_LOG = '/var/log/emerge.log'
 FETCH_LOG = '/var/log/emerge-fetch.log'   # parallel-fetch's output
+MTIMEDB = '/var/cache/edb/mtimedb'        # holds emerge's list for --resume
 DOWNLOAD_SUFFIX = '.__download__'         # Portage downloads to <file> plus this
 HISTORY_RUNS = 3      # average this many most recent builds of a package
 TICK = 0.1            # panel redraw interval, seconds
@@ -255,6 +257,8 @@ class Metadata:
     buildsys: cpv -> 'steps' if the build will print [N/M] counts, else 'none'
     fetch:    file -> size, for each source file not yet fully downloaded
     pkg_files: cpv -> the files in fetch that the package needs
+    mergelist: the cpvs emerge is merging, from its resume list, for when it
+               didn't print the list itself (no --ask, --verbose or --tree)
 
     fetch and pkg_files are replaced, never changed in place, so the main
     thread can read them while this one adds to them.
@@ -265,6 +269,7 @@ class Metadata:
         self.buildsys = {}
         self.fetch = {}
         self.pkg_files = {}
+        self.mergelist = None
         self.tmpdir = '/var/tmp'
         self.distdir = '/var/cache/distfiles'
         self.alert_sgr = ALERT_SGR
@@ -277,6 +282,10 @@ class Metadata:
 
     def request_fetch(self, cpv, repo):
         self.requests.put(('fetch', cpv, repo))
+
+    def request_mergelist(self, first):
+        """Read emerge's resume list; first is a cpv that must be on it."""
+        self.requests.put(('mergelist', first, None))
 
     def _load_history(self):
         self.history = load_history()
@@ -296,13 +305,39 @@ class Metadata:
             what, cpv, repo = self.requests.get()
             if what == 'buildsys' and cpv not in self.buildsys:
                 self.buildsys[cpv] = self._buildsys(portdb, cpv, repo)
-            elif what == 'fetch' and cpv not in self.pkg_files and portdb is not None:
-                try:
-                    files = self._fetch_sizes(portdb, settings, cpv, repo)
-                except Exception:
-                    files = {}
-                self.fetch = {**self.fetch, **files}
-                self.pkg_files = {**self.pkg_files, cpv: list(files)}
+            elif what == 'fetch':
+                self._add_fetch(portdb, settings, cpv, repo)
+            elif what == 'mergelist':
+                cpvs = self._mergelist(cpv)
+                if cpvs:
+                    self.mergelist = cpvs
+                    for c in cpvs:
+                        self._add_fetch(portdb, settings, c, None)
+                        if c not in self.buildsys:
+                            self.buildsys[c] = self._buildsys(portdb, c, None)
+
+    @staticmethod
+    def _mergelist(first):
+        """emerge saves what it's merging before it starts, in case of --resume."""
+        try:
+            with open(MTIMEDB) as f:
+                entries = json.load(f)['resume']['mergelist']
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+        cpvs = [e[2] for e in entries
+                if isinstance(e, list) and len(e) == 4 and e[0] == 'ebuild' and e[3] == 'merge']
+        # A list left over from an earlier run won't have this run's first package.
+        return cpvs if first in cpvs else None
+
+    def _add_fetch(self, portdb, settings, cpv, repo):
+        if cpv in self.pkg_files or portdb is None:
+            return
+        try:
+            files = self._fetch_sizes(portdb, settings, cpv, repo)
+        except Exception:
+            files = {}
+        self.fetch = {**self.fetch, **files}
+        self.pkg_files = {**self.pkg_files, cpv: list(files)}
 
     def _fetch_sizes(self, portdb, settings, cpv, repo):
         """The package's source files that aren't downloaded yet, with their
@@ -935,6 +970,9 @@ class Progress:
                     break
 
     def poll_downloads(self, now):
+        if len(self.planned) != self.n_total and self.meta.mergelist:
+            # emerge didn't print its list; its resume list is the same thing.
+            self.planned = self.meta.mergelist
         files = self.meta.fetch
         self.dl.poll(files, self.meta.distdir, now)
         show = self.dl.active(files) and (self.dl_rows or self.rows >= self.panel_height() + 2 + 3)
@@ -978,6 +1016,8 @@ class Progress:
             if not binary:
                 self.meta.request(cpv, repo)
                 self.meta.request_fetch(cpv, repo)
+        if len(self.planned) != self.n_total and self.current:
+            self.meta.request_mergelist(self.current.cpv)
         self.out('\x1b[?25l')
         self.set_region(h)
         return True
