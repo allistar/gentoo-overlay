@@ -16,6 +16,11 @@ generator) markers in the build output. Which packages will print them is
 known from their eclasses (cmake, meson, ninja-utils); other packages get a
 moving block with the elapsed and usual build time instead of a percentage.
 The overall ETA uses past build times from /var/log/emerge.log.
+
+While there are source files left to download, two more rows show the
+download: its total comes from the packages' Manifests, and its progress from
+the files growing in DISTDIR (Portage downloads to <name>.__download__).
+Problems such as a mirror timing out are read from /var/log/emerge-fetch.log.
 """
 
 import codecs
@@ -49,6 +54,9 @@ Portage repeats elog messages at the end of the run. Compiler and configure
 warnings are counted in the panel but hidden; Portage itself reports the ones
 that matter as a QA Notice.
 
+While source files are still downloading, the panel shows a download bar too,
+and a package waiting for its files shows "Downloading NN%".
+
   --ep-full       start by showing the full build output
   --ep-warnings   also show compiler and configure warnings
   --ep-no-color   no colour in the panel or in emerge's output
@@ -64,6 +72,8 @@ Examples:
 """
 
 EMERGE_LOG = '/var/log/emerge.log'
+FETCH_LOG = '/var/log/emerge-fetch.log'   # parallel-fetch's output
+DOWNLOAD_SUFFIX = '.__download__'         # Portage downloads to <file> plus this
 HISTORY_RUNS = 3      # average this many most recent builds of a package
 TICK = 0.1            # panel redraw interval, seconds
 MAX_SLOTS = 3         # most packages shown at once with --jobs
@@ -74,6 +84,8 @@ STATS_W = 39          # width of the numbers to the right of each bar
 DETAIL_W = 15         # width of the middle column of those numbers
 POLL_PHASE = 1.0      # seconds between checks of the build directory's phase markers
 SWEEP = 6             # width of the moving block on a bar with no progress info
+SPEED_WINDOW = 15     # seconds of download history used for the speed
+PROBLEM_SHOW = 30     # seconds a download problem stays on the panel
 
 SPINNER = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
 EIGHTHS = ' ▏▎▍▌▋▊▉'
@@ -90,7 +102,7 @@ FAILED_RE = re.compile(r'^\s*\* ERROR: (\S+) failed')
 LOGFILE_RE = re.compile(r"'(/\S+/build\.log)'")
 JOBS_RE = re.compile(r'Jobs: \d+ of \d+ complete')
 JOBS_ARG_RE = re.compile(r'^(?:--jobs(?:$|=(?!1$))|-[A-Za-z]*j(?!1$))')
-PLANNED_RE = re.compile(r'^\[(?:ebuild|binary)\s[^\]]*\]\s+(\S+/\S+)')
+PLANNED_RE = re.compile(r'^\[(ebuild|binary)\s[^\]]*\]\s+(\S+/\S+)')
 PLANNED_HEADER = 'These are the packages that would be'
 STEP_RE = re.compile(r'\[\s*(\d+)\s*/\s*(\d+)\s*\]')
 PCT_RE = re.compile(r'\[\s*(\d{1,3})%\s*\]')
@@ -113,6 +125,8 @@ DISTCC_RE = re.compile(r'^\s*(?:\d+:\d\d\.\d\d\s+)?distcc\[\d+\]')
 
 def is_warning(plain):
     return bool(DISTCC_RE.match(plain) or WARN_RE.search(plain))
+
+
 # Phase lines emerge prints with --quiet-build=n. "Installing" is src_install
 # into the image directory; "Merging" is copying the image onto the system.
 PHASES = [(re.compile(p), name) for p, name in (
@@ -147,6 +161,16 @@ STEP_ECLASSES = {'cmake', 'cmake-multilib', 'meson', 'meson-multilib', 'ninja-ut
 
 VERSION_RE = re.compile(r'-\d+(?:\.\d+)*[a-z]?(?:_(?:alpha|beta|pre|rc|p)\d*)*(?:-r\d+)?$')
 LOG_RE = re.compile(r'^(\d+):\s+(>>> emerge|::: completed emerge) \(\d+ of \d+\) (\S+) to ')
+# Download problems, from Portage's and wget's messages: (pattern, is it
+# fatal for the file, what to show).
+FETCH_PROBLEMS = [
+    # (Portage also probes each mirror for a layout.conf; that failing is harmless.)
+    (re.compile(r"^!!! Couldn't download '(?!\.layout\.conf)(.+?)'"), True, "couldn't download {}"),
+    (re.compile(r'^!!! Fetched file: (\S+) VERIFY FAILED'), True, '{} failed its checksum'),
+    (re.compile(r'\bERROR (\d{3}: .+?)\.?$'), False, 'mirror said {}, trying the next'),
+    (re.compile(r'Read error at byte .*?\((.+?)\)'), False, 'retrying: {}'),
+    (re.compile(r'\.\.\. failed: (.+?)\.?$'), False, 'retrying: {}'),
+]
 
 
 def strip_ansi(s):
@@ -159,7 +183,8 @@ def sanitize(s):
 
 
 def cpv_of(atom):
-    return atom.split('::', 1)[0]
+    """cat/pkg-1.0 from cat/pkg-1.0:slot::repo (emerge -v shows the slot)."""
+    return atom.split('::', 1)[0].split(':', 1)[0]
 
 
 def pkg_key(cpv):
@@ -179,6 +204,14 @@ def ellipsize(s, n):
 
 def plural(n, word):
     return f'{n} {word}' + ('' if n == 1 else 's')
+
+
+def mib(n, small):
+    return f'{n / 2**20:,.1f}' if small else f'{n / 2**20:,.0f}'
+
+
+def speed(rate):
+    return f'{rate / 2**20:.1f} MiB/s' if rate >= 2**20 else f'{rate / 1024:.0f} KiB/s'
 
 
 def term_size():
@@ -220,19 +253,30 @@ class Metadata:
 
     history:  cat/pkg -> average build seconds (from emerge.log)
     buildsys: cpv -> 'steps' if the build will print [N/M] counts, else 'none'
+    fetch:    file -> size, for each source file not yet fully downloaded
+    pkg_files: cpv -> the files in fetch that the package needs
+
+    fetch and pkg_files are replaced, never changed in place, so the main
+    thread can read them while this one adds to them.
     """
 
     def __init__(self):
         self.history = None
         self.buildsys = {}
+        self.fetch = {}
+        self.pkg_files = {}
         self.tmpdir = '/var/tmp'
+        self.distdir = '/var/cache/distfiles'
         self.alert_sgr = ALERT_SGR
         self.requests = queue.Queue()
         threading.Thread(target=self._load_history, daemon=True).start()
         threading.Thread(target=self._serve, daemon=True).start()
 
     def request(self, cpv, repo):
-        self.requests.put((cpv, repo))
+        self.requests.put(('buildsys', cpv, repo))
+
+    def request_fetch(self, cpv, repo):
+        self.requests.put(('fetch', cpv, repo))
 
     def _load_history(self):
         self.history = load_history()
@@ -241,15 +285,51 @@ class Metadata:
         try:
             import portage
             portdb = portage.db[portage.root]['porttree'].dbapi
+            settings = portage.config(clone=portage.settings)
             self.tmpdir = portage.settings.get('PORTAGE_TMPDIR', self.tmpdir)
+            self.distdir = portage.settings.get('DISTDIR', self.distdir)
             import portage.output   # honours /etc/portage/color.map
             self.alert_sgr = {portage.output.style_to_ansi_code(s) for s in ALERT_STYLES}
         except Exception:
-            portdb = None
+            portdb = settings = None
         while True:
-            cpv, repo = self.requests.get()
-            if cpv not in self.buildsys:
+            what, cpv, repo = self.requests.get()
+            if what == 'buildsys' and cpv not in self.buildsys:
                 self.buildsys[cpv] = self._buildsys(portdb, cpv, repo)
+            elif what == 'fetch' and cpv not in self.pkg_files and portdb is not None:
+                try:
+                    files = self._fetch_sizes(portdb, settings, cpv, repo)
+                except Exception:
+                    files = {}
+                self.fetch = {**self.fetch, **files}
+                self.pkg_files = {**self.pkg_files, cpv: list(files)}
+
+    def _fetch_sizes(self, portdb, settings, cpv, repo):
+        """The package's source files that aren't downloaded yet, with their
+        sizes from the Manifest. Files you have to fetch by hand are left out."""
+        ebuild, tree = portdb.findname2(cpv, myrepo=repo)
+        if ebuild is None:
+            return {}
+        settings.setcpv(cpv, mydb=portdb)
+        if 'fetch' in settings.get('PORTAGE_RESTRICT', '').split():
+            return {}
+        names = portdb.getFetchMap(cpv, useflags=settings['PORTAGE_USE'].split(), mytree=tree)
+        pkgdir = os.path.dirname(ebuild)
+        digests = portdb.repositories.get_repo_for_location(tree).load_manifest(
+            pkgdir, self.distdir).getDigests()
+        files = {}
+        for name in names:
+            try:
+                size = int(digests[name]['size'])
+            except (KeyError, ValueError):
+                continue
+            try:
+                if os.stat(os.path.join(self.distdir, name)).st_size == size:
+                    continue
+            except OSError:
+                pass
+            files[name] = size
+        return files
 
     @staticmethod
     def _buildsys(portdb, cpv, repo):
@@ -278,6 +358,7 @@ class Styles:
         'pkg': ((64, 160, 255), (80, 220, 140), 43),
         'all': ((140, 120, 255), (210, 120, 230), 141),
         'fail': ((230, 90, 90), (230, 90, 90), 167),
+        'dl': ((240, 160, 60), (250, 215, 100), 215),
     }
 
     def __init__(self, on, truecolor):
@@ -377,6 +458,102 @@ class Pkg:
         return left
 
 
+class Downloads:
+    """How far Portage has got with the source files this emerge needs."""
+
+    def __init__(self):
+        self.got = {}             # file -> bytes on disk so far
+        self.complete = set()
+        self.done = self.total = 0
+        self.current = None       # the file most recently written to
+        self.start = None         # when there was first something to download
+        self.samples = collections.deque()
+        self.problem = None       # (text, fatal, time)
+        self.log = None
+        self.log_buf = b''
+        try:
+            self.log = open(FETCH_LOG, 'rb')
+            self.log.seek(0, os.SEEK_END)   # only this run's messages
+        except OSError:
+            pass
+
+    def poll(self, files, distdir, now):
+        """Measure the files from their size on disk."""
+        newest = 0.0
+        for name, size in files.items():
+            if name in self.complete:
+                continue
+            path = os.path.join(distdir, name)
+            try:
+                if os.stat(path).st_size == size:
+                    self.complete.add(name)
+                    self.got[name] = size
+                    continue
+            except OSError:
+                pass
+            try:
+                st = os.stat(path + DOWNLOAD_SUFFIX)
+            except OSError:
+                continue
+            self.got[name] = min(st.st_size, size)
+            if st.st_mtime > newest:
+                newest, self.current = st.st_mtime, name
+        self.total = sum(files.values())
+        self.done = sum(self.got.get(name, 0) for name in files)
+        if self.total and self.start is None:
+            self.start = now
+        self.samples.append((now, self.done))
+        while len(self.samples) > 2 and now - self.samples[0][0] > SPEED_WINDOW:
+            self.samples.popleft()
+        self.read_log()
+
+    def read_log(self):
+        if self.log is None:
+            return
+        try:
+            data = self.log_buf + self.log.read()
+        except OSError:
+            return
+        *lines, self.log_buf = data.split(b'\n')
+        self.log_buf = self.log_buf[-8192:]
+        for line in lines:
+            for seg in line.split(b'\r'):
+                self.note(strip_ansi(seg.decode('utf-8', 'replace')).strip())
+
+    def note(self, plain):
+        """Remember the latest problem reported while downloading."""
+        for rx, fatal, text in FETCH_PROBLEMS:
+            if m := rx.search(plain):
+                detail = m[1]
+                self.problem = (text.format(detail[:1].lower() + detail[1:]), fatal, time.time())
+                return
+
+    def active(self, files):
+        return bool(files) and len(self.complete) < len(files)
+
+    def rate(self):
+        (t0, d0), (t1, d1) = self.samples[0], self.samples[-1]
+        return (d1 - d0) / (t1 - t0) if t1 - t0 >= 2 else None
+
+    def eta(self):
+        rate = self.rate()
+        if self.total and self.done >= self.total:
+            return 0.0
+        return (self.total - self.done) / rate if rate else None
+
+    def fraction_of(self, names, files):
+        """Share of the given files downloaded, or None if they're all here."""
+        need = sum(files.get(n, 0) for n in names)
+        if not need or all(n in self.complete for n in names):
+            return None
+        return sum(self.got.get(n, 0) for n in names) / need
+
+    def recent_problem(self, now):
+        if self.problem and now - self.problem[2] < PROBLEM_SHOW:
+            return self.problem
+        return None
+
+
 class Progress:
     def __init__(self, cmd, full, warnings, colour):
         self.cmd = cmd
@@ -402,6 +579,7 @@ class Progress:
         self.n_total = 0
         self.n_emerging = 0
         self.planned = []
+        self.planned_info = {}    # cpv -> (binary, repo) from emerge's package list
         self.started = set()
         self.active = {}
         self.current = None
@@ -412,6 +590,8 @@ class Progress:
         self.jobs_mode = any(JOBS_ARG_RE.match(a) for a in cmd[1:])
         self.max_active = 1
         self.warnings = self.errors = 0
+        self.dl = Downloads()
+        self.dl_rows = False      # the download rows are on the panel
 
     # --- process and terminal plumbing ---
 
@@ -498,6 +678,7 @@ class Progress:
             now = time.time()
             if self.panel and now - self.last_poll >= POLL_PHASE:
                 self.poll_phases()
+                self.poll_downloads(now)
                 self.last_poll = now
             if self.panel and now - self.last_draw >= TICK:
                 self.draw()
@@ -592,7 +773,9 @@ class Progress:
         if plain.startswith(PLANNED_HEADER):
             self.planned = []
         elif m := PLANNED_RE.match(plain):
-            self.planned.append(cpv_of(m[1]))
+            cpv, repo = cpv_of(m[2]), m[2].partition('::')[2]
+            self.planned.append(cpv)
+            self.planned_info[cpv] = (m[1] == 'binary', repo or None)
         elif EMERGE_RE.match(plain) and not self.panel_done:
             self.event(plain)
             return self.enter_panel()
@@ -626,6 +809,8 @@ class Progress:
             return
         if JOBS_RE.search(plain):
             return
+        if self.current and self.current.phase == 'Downloading':
+            self.dl.note(plain)
         if is_warning(plain):
             self.warnings += 1
         if ERR_RE.search(plain) and not DISTCC_RE.match(plain):
@@ -706,6 +891,7 @@ class Progress:
         self.started.add(cpv)
         if not binary:
             self.meta.request(cpv, repo or None)
+            self.meta.request_fetch(cpv, repo or None)
         if len(self.active) > self.max_active:
             self.max_active = len(self.active)
             if self.panel:
@@ -748,6 +934,14 @@ class Progress:
                         pkg.phase = phase
                     break
 
+    def poll_downloads(self, now):
+        files = self.meta.fetch
+        self.dl.poll(files, self.meta.distdir, now)
+        show = self.dl.active(files) and (self.dl_rows or self.rows >= self.panel_height() + 2 + 3)
+        if show != self.dl_rows:
+            self.dl_rows = show
+            self.set_region(self.panel_height())
+
     def overall_eta(self, now):
         hist = self.meta.history or {}
         known = [d for d in (hist.get(pkg_key(c)) for c in self.planned) if d]
@@ -761,12 +955,17 @@ class Progress:
         if None in pending or None in left:
             return None
         parallel = max(1, len(self.active)) if self.jobs_mode else 1
-        return sum(pending) / parallel + max(left, default=0.0)
+        eta = sum(pending) / parallel + max(left, default=0.0)
+        # On a slow connection the downloads, not the builds, set the pace.
+        if self.dl_rows and (dl := self.dl.eta()) is not None:
+            eta = max(eta, dl)
+        return eta
 
     # --- the panel ---
 
     def panel_height(self):
-        return 1 + 2 * min(MAX_SLOTS, self.max_active) + (1 if self.n_total > 1 else 0)
+        return (1 + 2 * min(MAX_SLOTS, self.max_active) + (2 if self.dl_rows else 0)
+                + (1 if self.n_total > 1 else 0))
 
     def enter_panel(self):
         h = self.panel_height()
@@ -775,18 +974,26 @@ class Progress:
         self.panel = True
         self.t0 = time.time()
         for cpv in self.planned:   # look up the rest of the list in advance
-            self.meta.request(cpv, None)
+            binary, repo = self.planned_info.get(cpv, (False, None))
+            if not binary:
+                self.meta.request(cpv, repo)
+                self.meta.request_fetch(cpv, repo)
         self.out('\x1b[?25l')
         self.set_region(h)
         return True
 
     def set_region(self, h):
         """Reserve the bottom h rows for the panel and scroll the log above it."""
-        self.height = h
+        old, self.height = self.height, h
         top = self.rows - h
-        # Scroll the screen up to make room (when the cursor is near the
-        # bottom), then limit scrolling to the rows above the panel.
-        self.out('\x1b7\x1b[r\x1b8' + '\n' * h + f'\x1b[{h}A\x1b7\x1b[1;{top}r\x1b8')
+        if self.panel and h < old:
+            # Hand the rows back to the log, blank: it carries on into them.
+            clear = ''.join(f'\x1b[{r};1H\x1b[2K' for r in range(self.rows - old + 1, top + 1))
+            self.out(f'\x1b7\x1b[r{clear}\x1b8\x1b7\x1b[1;{top}r\x1b8')
+        else:
+            # Scroll the screen up to make room (when the cursor is near the
+            # bottom), then limit scrolling to the rows above the panel.
+            self.out('\x1b7\x1b[r\x1b8' + '\n' * h + f'\x1b[{h}A\x1b7\x1b[1;{top}r\x1b8')
         set_winsize(self.master, top, self.cols)
         self.draw()
 
@@ -845,6 +1052,8 @@ class Progress:
                 lines += [self.header_line(pkgs[i], now), self.pkg_bar(pkgs[i], now)]
             else:
                 lines += ['', '']
+        if self.dl_rows:
+            lines += [self.download_header(now), self.download_bar(now)]
         if self.n_total > 1:
             lines.append(self.overall_bar(now, eta))
         return lines
@@ -882,11 +1091,52 @@ class Progress:
             icon, icon_style, phase_style = SPINNER[int(now * 10) % len(SPINNER)], S.cyan, S.yellow
         w = self.cols - 1
         count = f'({pkg.idx}/{self.n_total})'
-        fixed = 3 + len(count) + 1 + len(pkg.phase)
+        phase = pkg.phase
+        if not pkg.done and PHASE_ORDER.get(phase, 99) <= PHASE_ORDER['Downloading']:
+            # Not started on the build: it may be waiting for its files.
+            frac = self.dl.fraction_of(self.meta.pkg_files.get(pkg.cpv, ()), self.meta.fetch)
+            if frac is not None:
+                phase = f'Downloading {int(frac * 100)}%'
+        fixed = 3 + len(count) + 1 + len(phase)
         name = ellipsize(pkg.cpv, w - fixed - 1)
         pad = max(1, w - fixed - len(name))
         return (f' {icon_style}{icon}{S.reset} {S.dim}{count}{S.reset} {S.bold}{name}{S.reset}'
-                f'{" " * pad}{phase_style}{pkg.phase}{S.reset}')
+                f'{" " * pad}{phase_style}{phase}{S.reset}')
+
+    def download_header(self, now):
+        S = self.st
+        w = self.cols - 1
+        label = 'Downloading'
+        files = self.meta.fetch
+        if problem := self.dl.recent_problem(now):
+            text, fatal, _ = problem
+            bits, style = [text], S.red if fatal else S.yellow
+        else:
+            owner = next((c for c, names in self.meta.pkg_files.items()
+                          if self.dl.current in names), None)
+            left = len(files) - len(self.dl.complete)
+            bits = [owner or self.dl.current or 'waiting', plural(left, 'file') + ' to go']
+            if rate := self.dl.rate():
+                bits.append(speed(rate))
+            style = ''
+        room = w - 3 - 1 - len(label)
+        # Drop the speed, then the file count, before shortening the name.
+        while len(bits) > 1 and len(' · '.join(bits)) > room:
+            bits.pop()
+        text = ellipsize(' · '.join(bits), room - 1)
+        pad = max(1, room - len(text))
+        return (f' {S.yellow}⇣{S.reset} {style}{S.bold if not style else ""}{text}{S.reset}'
+                f'{" " * pad}{S.yellow}{label}{S.reset}')
+
+    def download_bar(self, now):
+        dl = self.dl
+        frac = dl.done / dl.total if dl.total else 0.0
+        small = dl.total < 10 * 2**20
+        eta = dl.eta()
+        return self.bar_line(
+            frac, 'dl', now, f'{int(frac * 100)}%',
+            f'{mib(dl.done, small)}/{mib(dl.total, small)} MiB',
+            fmt(now - (dl.start or now)), '~' + fmt(eta) if eta is not None else '')
 
     def pkg_bar(self, pkg, now):
         elapsed = fmt((pkg.end or now) - pkg.start)
@@ -971,6 +1221,8 @@ class Progress:
             parts.append(f'{S.red}✖ {len(self.failed)} failed{S.reset}')
         if self.warnings:
             parts.append(f'{S.yellow}{plural(self.warnings, "warning")}{S.reset}')
+        if self.dl.done:
+            parts.append(f'⇣ {mib(self.dl.done, self.dl.done < 10 * 2**20)} MiB downloaded')
         parts.append(f'{S.dim}in {fmt(time.time() - self.t0)}{S.reset}')
         self.log('\n' + '   '.join(parts))
         for cpv, path in self.failed:
