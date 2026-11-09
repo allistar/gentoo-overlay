@@ -165,11 +165,12 @@ VERSION_RE = re.compile(r'-\d+(?:\.\d+)*[a-z]?(?:_(?:alpha|beta|pre|rc|p)\d*)*(?
 LOG_RE = re.compile(r'^(\d+):\s+(>>> emerge|::: completed emerge) \(\d+ of \d+\) (\S+) to ')
 # Download problems, from Portage's and wget's messages: (pattern, is it
 # fatal for the file, what to show).
+DOWNLOADING_RE = re.compile(r">>> Downloading '([^']+)'")
 FETCH_PROBLEMS = [
     # (Portage also probes each mirror for a layout.conf; that failing is harmless.)
     (re.compile(r"^!!! Couldn't download '(?!\.layout\.conf)(.+?)'"), True, "couldn't download {}"),
     (re.compile(r'^!!! Fetched file: (\S+) VERIFY FAILED'), True, '{} failed its checksum'),
-    (re.compile(r'\bERROR (\d{3}: .+?)\.?$'), False, 'mirror said {}, trying the next'),
+    (re.compile(r'\bERROR (\d{3}: .+?)\.?$'), False, 'server said {}, trying the next'),
     (re.compile(r'Read error at byte .*?\((.+?)\)'), False, 'retrying: {}'),
     (re.compile(r'\.\.\. failed: (.+?)\.?$'), False, 'retrying: {}'),
 ]
@@ -257,6 +258,8 @@ class Metadata:
     buildsys: cpv -> 'steps' if the build will print [N/M] counts, else 'none'
     fetch:    file -> size, for each source file not yet fully downloaded
     pkg_files: cpv -> the files in fetch that the package needs
+    uri_files: download URL -> file, for URLs whose last part isn't the file's
+               name (SRC_URI "-> newname" renames)
     mergelist: the cpvs emerge is merging, from its resume list, for when it
                didn't print the list itself (no --ask, --verbose or --tree)
 
@@ -269,6 +272,7 @@ class Metadata:
         self.buildsys = {}
         self.fetch = {}
         self.pkg_files = {}
+        self.uri_files = {}
         self.mergelist = None
         self.tmpdir = '/var/tmp'
         self.distdir = '/var/cache/distfiles'
@@ -332,14 +336,16 @@ class Metadata:
     def _add_fetch(self, portdb, settings, cpv, repo):
         if cpv in self.pkg_files or portdb is None:
             return
+        uris = {}
         try:
-            files = self._fetch_sizes(portdb, settings, cpv, repo)
+            files = self._fetch_sizes(portdb, settings, cpv, repo, uris)
         except Exception:
             files = {}
         self.fetch = {**self.fetch, **files}
         self.pkg_files = {**self.pkg_files, cpv: list(files)}
+        self.uri_files = {**self.uri_files, **uris}
 
-    def _fetch_sizes(self, portdb, settings, cpv, repo):
+    def _fetch_sizes(self, portdb, settings, cpv, repo, uris):
         """The package's source files that aren't downloaded yet, with their
         sizes from the Manifest. Files you have to fetch by hand are left out."""
         ebuild, tree = portdb.findname2(cpv, myrepo=repo)
@@ -364,7 +370,15 @@ class Metadata:
             except OSError:
                 pass
             files[name] = size
+            uris.update((u, name) for u in names[name]
+                        if os.path.basename(u) != name and '://' in u)
         return files
+
+    def package_of(self, url_or_file):
+        """The package a download (a URL from the fetch log, or a file) is for."""
+        name = self.uri_files.get(url_or_file) or os.path.basename(url_or_file.split('?')[0])
+        cpv = next((c for c, names in self.pkg_files.items() if name in names), None)
+        return cpv, name
 
     @staticmethod
     def _buildsys(portdb, cpv, repo):
@@ -503,7 +517,8 @@ class Downloads:
         self.current = None       # the file most recently written to
         self.start = None         # when there was first something to download
         self.samples = collections.deque()
-        self.problem = None       # (text, fatal, time)
+        self.problem = None       # (text, fatal, time, URL being tried)
+        self.trying = None        # the URL Portage said it was downloading
         self.log = None
         self.log_buf = b''
         try:
@@ -556,11 +571,18 @@ class Downloads:
                 self.note(strip_ansi(seg.decode('utf-8', 'replace')).strip())
 
     def note(self, plain):
-        """Remember the latest problem reported while downloading."""
+        """Remember the latest problem reported while downloading, and the
+        URL it happened on: wget's messages don't say which file it was."""
+        if m := DOWNLOADING_RE.search(plain):
+            self.trying = m[1]
+            return
+        if 'layout.conf' in os.path.basename(self.trying or ''):
+            return   # Portage probing a mirror's layout; failures there are harmless
         for rx, fatal, text in FETCH_PROBLEMS:
             if m := rx.search(plain):
                 detail = m[1]
-                self.problem = (text.format(detail[:1].lower() + detail[1:]), fatal, time.time())
+                self.problem = (text.format(detail[:1].lower() + detail[1:]), fatal,
+                                time.time(), self.trying)
                 return
 
     def active(self, files):
@@ -1149,7 +1171,10 @@ class Progress:
         label = 'Downloading'
         files = self.meta.fetch
         if problem := self.dl.recent_problem(now):
-            text, fatal, _ = problem
+            text, fatal, _, url = problem
+            if url:
+                cpv, name = self.meta.package_of(url)
+                text = f'{cpv or name}: {text}'
             bits, style = [text], S.red if fatal else S.yellow
         else:
             owner = next((c for c, names in self.meta.pkg_files.items()
